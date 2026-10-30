@@ -130,6 +130,8 @@ export class Inbox {
         this.store.set('operation',id,{...value,chat,request:undefined,state:value.state==='prepared'?'cancelled':value.state},{expires:value.expiresAt,created:value.createdAt,tag:value.messageId});
       }
       this.store.remove('contact-binding',old);
+      const setting=this.store.get('setting',old);if(setting&&!this.store.get('setting',chat))this.store.set('setting',chat,setting);this.store.remove('setting',old);
+      const seed=this.store.get('history-seed',old);if(seed&&!this.store.get('history-seed',chat))this.store.set('history-seed',chat,{...seed,chat},{created:seed.createdAt,expires:seed.createdAt+WEEK});this.store.remove('history-seed',old);
       const previous=this.store.get('chat',old),canonical=this.store.get('chat',chat);if(previous){this.contact(chat,{...previous,...(canonical?.name&&canonical.name!=='WhatsApp contact'&&!canonical.name.startsWith('+')?{name:canonical.name}:{})});this.store.remove('chat',old);}
       this.revision(chat,'reset');
     });

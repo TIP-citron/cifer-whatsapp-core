@@ -77,3 +77,11 @@ test('alias duplicate merges keep shortest expiry, existing read marker and stro
  socket.ev.emit('messages.upsert',{messages:[fixtureMessage('DUP','canonical',{messageTimestamp:at,message:{extendedTextMessage:{text:'canonical',contextInfo:{expiration:86400}}}}),fixtureMessage('DUP','alias',{messageTimestamp:at,key:{remoteJid:lid,id:'DUP',fromMe:false}})]});await drain();await f.engine.request('markRead',{chat:PEER,ids:['DUP']});
  socket.ev.emit('contacts.upsert',[{id:lid,phoneNumber:PEER}]);await drain();const page=await f.engine.request('messages',{chat:PEER});assert.equal(page.messages.length,1);assert.equal(page.messages[0].expiresAt,at*1000+86400000);assert.equal((await f.engine.request('status')).unreadTotal,0);
 });
+test('every UUID bit contributes to WhatsApp ID and echoes cannot redirect into another operation chat',async t=>{
+ const f=await fixture(t),socket=await f.connect(),other='15550000003@s.whatsapp.net';
+ const a={operationId:'10000000-0000-4000-8000-000000000001',chat:PEER,text:'FIRST',kind:'ordinary'},b={operationId:'10000000-0000-4000-8000-000000000002',chat:other,text:'SECOND',kind:'ordinary'};
+ const pa=await f.engine.request('prepareSend',a),pb=await f.engine.request('prepareSend',b);assert.notEqual(pa.messageId,pb.messageId);await f.engine.request('send',a);
+ assert.equal((await f.engine.request('messages',{chat:PEER})).messages[0].text,'FIRST');assert.ok(!(await f.engine.request('messages',{chat:other})).messages.some(m=>m.text==='FIRST'));
+ socket.ev.emit('messages.upsert',{messages:[fixtureMessage(pa.messageId,'unrelated other chat',{key:{id:pa.messageId,remoteJid:other,fromMe:true}})]});await drain();
+ assert.equal((await f.engine.request('messages',{chat:PEER})).messages[0].text,'FIRST');assert.ok((await f.engine.request('messages',{chat:other})).messages.some(m=>m.text==='unrelated other chat'&&!m.operationId));
+});
