@@ -58,7 +58,7 @@ When `remoteUnlinked` is false, the user can revoke the linked device in WhatsAp
 | Method | Arguments | Result |
 | --- | --- | --- |
 | `status` | `{}` | State, identity, QR/code, expiry, connection, revision and content-free unread counts |
-| `pair` | `{phone?}` | Status; phone includes country code, digits only; request again after the QR-ready state if code linking is desired |
+| `pair` | `{phone?}` | Status; phone includes country code, digits only. First phone request waits up to 10 seconds for readiness, then up to 10 seconds for a code. Refreshing expired pairing restarts the unregistered socket. |
 | `chats` | `{before?,limit?}` | `{chats,cursor}`; default 10, max 100 |
 | `messages` | `{chat,before?,limit?}` | `{messages,cursor}`; default 20, max 100 |
 | `history` | `{chat,before?}` | `{state:'loading'|'ready'|'unavailable',hasMore?}`; phone fetches at most 20 per request |
@@ -128,6 +128,8 @@ contact names, phone/LID aliases, limited history, edits/deletes, disappearing
 expiry and delivery receipts. Media messages produce local placeholders. Groups,
 calls, reactions, status, attachment upload/download and profile-photo downloads
 are not implemented. No full WhatsApp-client parity is claimed.
+Ordinary outgoing text is limited to 2,000 UTF-8 bytes; incoming text/captions and
+protected wire records have their own bounded parsing limits.
 
 Baileys is an unofficial WhatsApp implementation. Automated fixtures validate the
 engine and real dependency event/serialization shapes, but do not replace a paired

@@ -16,7 +16,7 @@ class Engine {
     this.account=account;this.connection=connection;this.emit=onEvent;this.factory=socketFactory;
     this.store=new Store(directory,key,{account,connection});this.closed=false;this.stopping=false;this.epoch=0;this.socket=null;this.timer=null;this.attempts=0;
     this.state='disconnected';this.qr=null;this.pairCode=null;this.pairExpiresAt=null;this.identity=this.store.get('system','identity')||null;
-    this.queue=Promise.resolve();this.queued=0;this.inflight=new Set();this.changedScheduled=false;this.pairBusy=false;this.historyRequests=new Map();
+    this.queue=Promise.resolve();this.queued=0;this.inflight=new Set();this.changedScheduled=false;this.pairBusy=false;this.pairWaiters=new Set();this.historyRequests=new Map();
     this.inbox=new Inbox(this.store,chat=>this.changed(chat));
     for(const {id,value}of this.store.list('operation'))if(value.state==='sending')this.store.set('operation',id,{...value,state:'uncertain'},{expires:value.expiresAt,created:value.createdAt,tag:value.messageId});
     this.inbox.prune();
@@ -38,6 +38,7 @@ class Engine {
   }
   pause(state='disconnected'){
     ++this.epoch;clearTimeout(this.timer);this.timer=null;const socket=this.socket;this.socket=null;this.state=state;this.qr=null;this.pairCode=null;this.pairExpiresAt=null;
+    for(const finish of this.pairWaiters)finish(false);
     try{socket?.end(new Error('Local session paused'));}catch{}
   }
   scheduleReconnect(){if(this.closed||this.stopping)return;clearTimeout(this.timer);this.timer=setTimeout(()=>{this.timer=null;void this.start().catch(()=>{if(!this.closed&&!this.stopping){this.state='reconnect-required';this.statusChanged();}});},Math.min(30000,1000*2**Math.min(this.attempts++,5)));this.timer.unref?.();}
@@ -56,7 +57,7 @@ class Engine {
   async start(){
     this.active();if(this.socket)return this.status();
     this.store.set('system','auto-connect',true);const epoch=++this.epoch,live=()=>!this.closed&&!this.stopping&&epoch===this.epoch;
-    const auth=authStore(this.store,live);this.state=auth.state.creds.registered?'reconnecting':'pairing';this.qr=null;this.pairCode=null;
+    const auth=authStore(this.store,live);this.state=auth.state.creds.registered?'reconnecting':'pairing';this.qr=null;this.pairCode=null;this.pairExpiresAt=null;
     const socket=this.factory({auth:auth.state,logger,browser:Browsers.macOS('CIFER Local'),markOnlineOnConnect:false,syncFullHistory:false,enableRecentMessageCache:false,generateHighQualityLinkPreview:false,
       shouldSyncHistoryMessage:h=>![proto.Message.HistorySyncType.FULL,proto.Message.HistorySyncType.RECENT].includes(h.syncType),
       getMessage:async key=>{if(!live())return undefined;const clean=await this.cleanKey(key);if(!live()||!clean||this.store.get('tombstone',messageId(clean)))return undefined;const row=this.store.get('message',messageId(clean));return row&&row.expiresAt>Date.now()&&row.fromMe?{conversation:row.wire||row.text||''}:undefined;}
@@ -108,11 +109,34 @@ class Engine {
   async contacts(rows){for(const row of rows.slice(0,10000)){const chat=await this.canonical(row.id||row.lid,row.phoneNumber);if(!chat)continue;this.inbox.contact(chat,{name:row.name||row.notify||row.verifiedName});}this.changed();}
   async chatSettings(rows){for(const row of rows.slice(0,10000)){const chat=await this.canonical(row.id,row.pnJid);if(!chat)continue;const updatedAt=Math.min(Date.now(),Number(row.conversationTimestamp||0)*1000);this.inbox.contact(chat,{...(row.name?{name:row.name}:{}),...(Number.isSafeInteger(updatedAt)?{updatedAt}:{})});if(row.ephemeralExpiration!==undefined){const seconds=Number(row.ephemeralExpiration);if(Number.isSafeInteger(seconds)&&seconds>=0)this.store.set('setting',chat,{seconds});}const seed=row.messages?.[0]?.message,key=seed?keyOf(seed.key):null,at=Number(seed?.messageTimestamp)*1000;if(key&&Number.isSafeInteger(at)&&at>Date.now()-WEEK)this.store.set('history-seed',chat,{...key,chat,createdAt:at},{expires:at+WEEK,created:at});}this.changed();}
   async ingest(values,history=false){for(const row of values){const chat=await this.canonical(row.chat,row.alternate);if(!chat)continue;const candidates=row.fromMe?this.store.list('operation',{tag:row.id,limit:100}).map(r=>r.value):[];let op=null;for(const candidate of candidates)if(await this.canonical(candidate.chat)===chat){op=candidate;break;}const target=op?op.chat:chat;this.inbox.ingest({...row,chat:target},{history,operationId:op?.operationId});if(op){const expiresAt=Math.min(op.expiresAt,row.expiresAt);this.store.set('operation',op.operationId,{...op,expiresAt},{expires:expiresAt,created:op.createdAt,tag:op.messageId});this.inbox.delivery({chat:target,id:row.id,fromMe:true},receipt(row.status)||'sent');}}}
-  async pair(args){exact(args,[],['phone']);if(args.phone!==undefined&&(typeof args.phone!=='string'||!/^\d{7,15}$/.test(args.phone)))throw Error('Enter a WhatsApp phone number with country code.');await this.start();if(!args.phone)return this.status();if(this.state!=='pairing'||!this.qr||this.pairBusy)return this.status();const epoch=this.epoch;this.pairBusy=true;try{const code=await this.socket.requestPairingCode(args.phone);if(this.closed||epoch!==this.epoch)throw Error('WhatsApp connection changed.');if(typeof code!=='string'||!/^[A-Z0-9]{8}$/.test(code))throw Error('Pairing code is unavailable.');this.pairCode=code;this.pairExpiresAt=Date.now()+120000;this.statusChanged();return this.status();}finally{this.pairBusy=false;}}
+  async pairingReady(socket,epoch){
+    if(this.state==='pairing'&&this.qr&&this.pairExpiresAt>Date.now())return true;
+    return new Promise(resolve=>{
+      let timer;
+      const finish=value=>{clearTimeout(timer);socket.ev.off('connection.update',update);this.pairWaiters.delete(finish);resolve(value);};
+      const update=()=>{if(this.closed||this.stopping||epoch!==this.epoch||this.state!=='pairing')finish(false);else if(this.qr&&this.pairExpiresAt>Date.now())finish(true);};
+      this.pairWaiters.add(finish);socket.ev.on('connection.update',update);timer=setTimeout(()=>finish(false),10000);update();
+    });
+  }
+  async pair(args){
+    exact(args,[],['phone']);if(args.phone!==undefined&&(typeof args.phone!=='string'||!/^\d{7,15}$/.test(args.phone)))throw Error('Enter a WhatsApp phone number with country code.');
+    if(this.pairBusy)throw Error('WhatsApp pairing is already in progress.');
+    this.pairBusy=true;
+    try{
+      if(this.state==='pairing'&&this.socket&&this.pairExpiresAt&&this.pairExpiresAt<=Date.now())this.pause('pairing');
+      await this.start();if(!args.phone||this.state==='connected')return this.status();
+      const epoch=this.epoch,socket=this.socket;
+      if(!await this.pairingReady(socket,epoch))throw Error('WhatsApp pairing is not ready. Try again.');
+      const code=await bounded(socket.requestPairingCode(args.phone),10000,null);
+      if(this.closed||this.stopping||epoch!==this.epoch)throw Error('WhatsApp connection changed.');
+      if(typeof code!=='string'||!/^[A-Z0-9]{8}$/.test(code))throw Error('Pairing code is unavailable.');
+      this.pairCode=code;this.qr=null;this.pairExpiresAt=Date.now()+120000;this.statusChanged();return this.status();
+    }finally{this.pairBusy=false;}
+  }
   sendInput(args){
     exact(args,['operationId','chat','text','kind'],['prepared']);
     if(!uuidPattern.test(args.operationId)||!['ordinary','protected'].includes(args.kind)||typeof args.text!=='string'||!args.text.trim())throw Error('Invalid WhatsApp message.');
-    const chat=assertPeer(args.chat);if(args.kind==='ordinary'){if(Buffer.byteLength(args.text)>16000||args.prepared!==undefined||args.text.startsWith('CIFER:WA:'))throw Error('Invalid ordinary message.');}
+    const chat=assertPeer(args.chat);if(args.kind==='ordinary'){if(Buffer.byteLength(args.text)>2000||args.prepared!==undefined||args.text.startsWith('CIFER:WA:'))throw Error('Invalid ordinary message.');}
     else{const context=protectedWire(args.text);if(context.sender!==this.account||context.createdAt<=Date.now()-WEEK||context.createdAt>Date.now()+60000)throw Error('Protected message belongs to another account or expired.');validatePrepared(args.prepared,this.account,chat,args.text);if(canonicalJSON(this.store.get('contact-binding',chat))!==canonicalJSON(args.prepared.binding))throw Error('The confirmed contact changed. Prepare the message again.');}
     return safeClone({operationId:args.operationId,chat,text:args.text,kind:args.kind,...(args.prepared!==undefined?{prepared:args.prepared}:{})});
   }
@@ -135,7 +159,12 @@ class Engine {
     if(this.state!=='connected'||!this.socket)throw Error('Reconnect WhatsApp before sending.');
     if(!existing){const prepared=this.prepare(input);if(prepared.state!=='prepared')return prepared;}let record=this.store.get('operation',input.operationId),epoch=this.epoch,socket=this.socket;
     const setting=this.store.get('setting',record.chat);
-    record={...record,state:'sending',expiresAt:Math.min(record.expiresAt,setting?.seconds?record.createdAt+setting.seconds*1000:Infinity)};this.store.set('operation',record.operationId,record,{expires:record.expiresAt,created:record.createdAt,tag:record.messageId});this.changed(record.chat);
+    record={...record,state:'sending',expiresAt:Math.min(record.expiresAt,setting?.seconds?record.createdAt+setting.seconds*1000:Infinity)};
+    if(record.expiresAt<=Date.now()){
+      this.store.transaction(()=>{this.store.remove('operation',record.operationId);this.inbox.tombstone({chat:record.chat,id:record.messageId,fromMe:true});});
+      return this.operationView({...record,state:'cancelled',request:undefined});
+    }
+    this.store.set('operation',record.operationId,record,{expires:record.expiresAt,created:record.createdAt,tag:record.messageId});this.changed(record.chat);
     const job=(async()=>{
       try{
         const sent=await socket.sendMessage(record.chat,{text:input.text,linkPreview:null},{messageId:record.messageId,...(setting?{ephemeralExpiration:setting.seconds}:{})});
@@ -189,6 +218,7 @@ class Engine {
   }
   async finishDisconnect(){
     this.active();this.store.set('system','auto-connect',false);const socket=this.socket;this.stopping=true;++this.epoch;clearTimeout(this.timer);this.timer=null;this.socket=null;this.state='disconnected';this.qr=null;this.pairCode=null;this.pairExpiresAt=null;let remoteUnlinked=false;
+    for(const finish of this.pairWaiters)finish(false);
     if(socket){try{remoteUnlinked=await bounded(Promise.resolve(socket.logout()).then(()=>true),3000,false);}catch{}}
     try{socket?.end(new Error('WhatsApp disconnected'));}catch{}
     await this.queue;this.store.transaction(()=>{this.store.clear('wa-auth');this.store.clear('wa-key');this.store.remove('system','identity');this.inbox.reset();});this.store.checkpoint();this.identity=null;this.historyRequests.clear();this.stopping=false;if(!this.closing)this.statusChanged();return {disconnected:true,remoteUnlinked};

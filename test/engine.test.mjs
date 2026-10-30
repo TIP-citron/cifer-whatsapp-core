@@ -16,6 +16,21 @@ test('pairing, QR/code, contacts, unread selection and persistent reconnect rema
  await f.reopen();assert.equal(f.sockets.length,2);f.sockets.at(-1).ev.emit('connection.update',{connection:'open'});assert.equal((await f.engine.request('messages',{chat:PEER})).messages.length,2);
  const out=await f.engine.disconnect();assert.deepEqual(out,{disconnected:true,remoteUnlinked:true});assert.equal((await f.engine.request('messages',{chat:PEER})).messages.length,0);
 });
+test('first phone request awaits asynchronous readiness and expired QR refresh uses a fresh socket',async t=>{
+ const f=await fixture(t),first=f.engine.request('pair',{phone:'15550000002'});await drain();
+ let calls=0;f.sockets[0].requestPairingCode=async phone=>{assert.equal(phone,'15550000002');calls++;return 'ABCD1234';};
+ f.sockets[0].ev.emit('connection.update',{qr:'async-qr'});assert.equal((await first).pairCode,'ABCD1234');assert.equal(calls,1);
+ const real=Date.now,now=real();Date.now=()=>now+180000;
+ try{
+   assert.equal((await f.engine.request('pair')).qr,null);assert.equal(f.sockets.length,2);assert.equal(f.sockets[0].ended,true);
+   await drain();f.sockets[1].ev.emit('connection.update',{qr:'fresh-qr'});assert.equal((await f.engine.request('status')).qr,'fresh-qr');
+   f.sockets[0].ev.emit('connection.update',{qr:'stale-qr'});assert.equal((await f.engine.request('status')).qr,'fresh-qr');
+ }finally{Date.now=real;}
+});
+test('phone readiness wait is cancelled promptly by close',async t=>{
+ const f=await fixture(t),pair=f.engine.request('pair',{phone:'15550000002'});await drain();
+ const rejected=assert.rejects(pair,/pairing is not ready/);await f.engine.close();await rejected;
+});
 test('real Baileys edit/revoke event shapes update local history and block replay resurrection',async t=>{
  const f=await fixture(t),socket=await f.connect();socket.ev.emit('messages.upsert',{messages:[fixtureMessage('ORIGINAL','old')]});await drain();
  const emit=async protocolMessage=>{await processMessage(fixtureMessage('EVENT','',{message:{protocolMessage}}),{ev:socket.ev,creds:{me:{id:SELF}}});await drain();};
@@ -37,6 +52,23 @@ test('sends are durable/idempotent, preserve disappearance setting, and reconcil
  const first=await f.engine.request('send',args);await f.engine.request('send',args);assert.equal(socket.sent.length,1);assert.equal(socket.sent[0].options.ephemeralExpiration,86400);
  await assert.rejects(f.engine.request('send',{...args,text:'different'}));socket.ev.emit('messages.update',[{key:{remoteJid:PEER,id:first.messageId,fromMe:true},update:{status:4}}]);await drain();assert.equal((await f.engine.request('operation',{id:args.operationId})).state,'read');
  const uncertain={operationId:randomUUID(),chat:PEER,text:'network fails',kind:'ordinary'};socket.sendMessage=async()=>{throw Error('synthetic failure');};assert.equal((await f.engine.request('send',uncertain)).state,'uncertain');await f.reopen();f.sockets.at(-1).ev.emit('connection.update',{connection:'open'});assert.equal((await f.engine.request('send',uncertain)).state,'uncertain');assert.equal(f.sockets.at(-1).sent.length,0);
+});
+test('shortened expiration and deleted prepared operations cancel before any network send',async t=>{
+ const f=await fixture(t),socket=await f.connect(),args={operationId:randomUUID(),chat:PEER,text:'unsent private text',kind:'ordinary'};
+ await f.engine.request('prepareSend',args);const real=Date.now,now=real();Date.now=()=>now+10000;
+ try{
+   socket.ev.emit('chats.update',[{id:PEER,ephemeralExpiration:1}]);await drain();
+   assert.equal((await f.engine.request('send',args)).state,'cancelled');assert.equal((await f.engine.request('operation',{id:args.operationId})).state,'cancelled');assert.equal(socket.sent.length,0);
+   assert.equal((await f.engine.request('messages',{chat:PEER})).messages.length,0);
+ }finally{Date.now=real;}
+ const deleted={...args,operationId:randomUUID()},pending=await f.engine.request('prepareSend',deleted);
+ socket.ev.emit('messages.delete',{keys:[{id:pending.messageId,remoteJid:PEER,fromMe:true}]});await drain();
+ assert.equal((await f.engine.request('send',deleted)).state,'cancelled');assert.equal(socket.sent.length,0);
+});
+test('ordinary send limit is enforced in UTF-8 bytes at the engine boundary',async t=>{
+ const f=await fixture(t),socket=await f.connect(),args={operationId:randomUUID(),chat:PEER,text:'é'.repeat(1000),kind:'ordinary'};
+ await f.engine.request('send',args);assert.equal(socket.sent.length,1);
+ await assert.rejects(f.engine.request('prepareSend',{...args,operationId:randomUUID(),text:args.text+'a'}),/ordinary message/);assert.equal(socket.sent.length,1);
 });
 test('PN/LID mapping merges chats and deletion tombstones follow the alias',async t=>{
  const f=await fixture(t),socket=await f.connect(),lid='1234567890@lid';socket.ev.emit('messages.upsert',{messages:[fixtureMessage('ALIAS','text',{key:{id:'ALIAS',remoteJid:lid,fromMe:false}})]});await drain();

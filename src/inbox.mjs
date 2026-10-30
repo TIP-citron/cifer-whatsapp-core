@@ -51,7 +51,7 @@ export class Inbox {
       this.store.set('tombstone', id, { ...key, deleted:true }, { expires:now + WEEK, created:now, tag:key.chat });
       for (const {id:opId,value} of this.store.list('operation', {tag:key.id})) {
         if(!key.fromMe||value.chat!==key.chat)continue;
-        const next={...value,request:undefined,deleted:true}; this.store.set('operation',opId,next,{expires:value.expiresAt,created:value.createdAt,tag:key.id});
+        const next={...value,request:undefined,deleted:true,state:value.state==='prepared'?'cancelled':value.state}; this.store.set('operation',opId,next,{expires:value.expiresAt,created:value.createdAt,tag:key.id});
       }
       this.revision(key.chat, 'delete', { id:key.id });
     });
@@ -74,7 +74,7 @@ export class Inbox {
     if (old) { const delivery=strongest(old.delivery,state); if(delivery!==old.delivery)this.save({...old,delivery}); }
     for(const {id:opId,value} of this.store.list('operation',{tag:key.id})) {
       if(!key.fromMe||value.chat!==key.chat)continue;
-      if (!['prepared','failed'].includes(value.state)) {
+      if (!['prepared','failed','cancelled'].includes(value.state)) {
         const delivery=strongest(value.state,state);
         this.store.set('operation',opId,{...value,state:delivery,...(['sent','delivered','read'].includes(delivery)?{request:undefined}:{})},{expires:value.expiresAt,created:value.createdAt,tag:key.id});
       }
