@@ -16,6 +16,13 @@ test('pairing, QR/code, contacts, unread selection and persistent reconnect rema
  await f.reopen();assert.equal(f.sockets.length,2);f.sockets.at(-1).ev.emit('connection.update',{connection:'open'});assert.equal((await f.engine.request('messages',{chat:PEER})).messages.length,2);
  const out=await f.engine.disconnect();assert.deepEqual(out,{disconnected:true,remoteUnlinked:true});assert.equal((await f.engine.request('messages',{chat:PEER})).messages.length,0);
 });
+test('local seen markers refresh metadata only while deletion still invalidates message content',async t=>{
+ const f=await fixture(t),socket=await f.connect();socket.ev.emit('messages.upsert',{messages:[fixtureMessage('VISIBLE')]});await drain();f.events.length=0;
+ await f.engine.request('markRead',{chat:PEER,ids:['VISIBLE']});await drain();
+ assert.deepEqual(f.events.map(event=>event.type),['metadata']);assert.equal((await f.engine.request('status')).unreadTotal,0);
+ f.events.length=0;await f.engine.request('markRead',{chat:PEER,ids:['VISIBLE']});await drain();assert.equal(f.events.length,0);
+ socket.ev.emit('messages.delete',{keys:[{remoteJid:PEER,id:'VISIBLE',fromMe:false}]});await drain();assert.ok(f.events.some(event=>event.type==='changed'));assert.equal((await f.engine.request('messages',{chat:PEER})).messages.length,0);
+});
 test('first phone request awaits asynchronous readiness and expired QR refresh uses a fresh socket',async t=>{
  const f=await fixture(t),first=f.engine.request('pair',{phone:'15550000002'});await drain();
  let calls=0;f.sockets[0].requestPairingCode=async phone=>{assert.equal(phone,'15550000002');calls++;return 'ABCD1234';};

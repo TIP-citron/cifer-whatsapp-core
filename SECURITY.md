@@ -26,6 +26,15 @@ No listener, cloud token, arbitrary URL operation, generic decryption operation,
 filesystem request or shell command is exposed. Requests reject extra fields and
 validate peer IDs and sizes. Only individual WhatsApp chats are supported.
 
+Profile photos are a separate bounded download path: only already-known chats
+can schedule a WhatsApp preview query. Its returned URL must be HTTPS on a
+WhatsApp subdomain, with no credentials, custom port or fragment; redirects are
+rejected and no cookies/referrer are supplied. Content length and streamed bytes
+are capped at 32 KiB. Only bounded, nonanimated JPEG/PNG/WebP raster containers
+are returned over IPC as data URIs. Image decoding remains part of the trusted
+renderer runtime; the native boundary and UI also validate the thumbnail.
+This does not add an egress firewall around all Baileys history/app-state traffic.
+
 ## Persistence and lifecycle
 
 Credentials and Signal key batches are transactional. The storage key is copied
@@ -44,6 +53,13 @@ Edits scrub original outbox bodies, deletes create tombstones and expiry is chec
 before reads. Alias merges apply tombstones first and keep stricter expiry. A
 prepared operation cannot silently move to another confirmed contact. Ambiguous
 sends are uncertain; the engine does not resend them automatically.
+
+Encrypted profile cache is bound to the same account/connection, capped at 100
+records and 4 MiB, and expires after one hour (negative answers ten minutes,
+transient failures one minute). Expired bytes cannot be read and are pruned on
+the next cleanup; the renderer clears its own copy on lock/account switch.
+Photo removal invalidates cached data and in-flight work. Close/pause aborts
+downloads and prevents stale completions from writing; unlink clears the cache.
 
 Before importing the engine in the helper, silence dependency console methods.
 Never log transport errors, auth objects, QR codes or message content. The bundled

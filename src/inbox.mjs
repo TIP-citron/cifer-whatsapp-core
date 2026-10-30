@@ -13,10 +13,10 @@ const pageLimit = (value, fallback) => { const limit = value ?? fallback; if (!N
 
 export class Inbox {
   constructor(store, changed, limits = {}) { this.store = store; this.changed = changed; this.maxMessages=Math.min(MAX_MESSAGES,limits.maxMessages??MAX_MESSAGES);this.maxBytes=Math.min(MAX_BYTES,limits.maxBytes??MAX_BYTES); }
-  revision(chat, type = 'upsert', key = {}) {
+  revision(chat, type = 'upsert', key = {}, metadata = false) {
     const revision = this.store.next();
     this.store.set('change', String(revision), { revision, type, chat, ...key }, { expires: Date.now() + WEEK, created: revision });
-    this.changed(chat); return revision;
+    this.changed(chat,metadata); return revision;
   }
   contact(chat, value = {}) {
     const old = this.store.get('chat', chat) || { id: chat, name: chat.endsWith('@s.whatsapp.net') ? '+' + chat.split('@')[0] : 'WhatsApp contact', updatedAt: 0 };
@@ -40,8 +40,8 @@ export class Inbox {
     this.store.transaction(() => { this.save(row); this.contact(row.chat, { updatedAt: row.createdAt, ...(!row.fromMe && clean.name ? { name:clean.name } : {}) }); });
     this.trim(); return true;
   }
-  save(row) {
-    row.revision = this.revision(row.chat, 'upsert', { id:row.id });
+  save(row, metadata = false) {
+    row.revision = this.revision(row.chat, metadata?'metadata':'upsert', { id:row.id }, metadata);
     this.store.set('message', messageId(row), row, { expires:row.expiresAt, created:row.createdAt, tag:row.chat, unread:!row.fromMe&&!row.readAt });
   }
   tombstone(key, now = Date.now()) {
@@ -99,7 +99,7 @@ export class Inbox {
     }
     rows.sort((a,b)=>b.updatedAt-a.updatedAt||b.id.localeCompare(a.id));
     const filtered=before?rows.filter(r=>r.updatedAt<before[0]||r.updatedAt===before[0]&&r.id<before[1]):rows,page=filtered.slice(0,limit);
-    return {chats:page.map(chat=>{const last=this.store.list('message',{tag:chat.id,limit:1})[0]?.value;return {...chat,...(last?{lastMessage:last.kind==='protected'?'CIFER protected message':last.text||last.label||'Message'}:{})};}),cursor:filtered.length>limit?encodeCursor(page.at(-1)):null};
+    return {chats:page.map(chat=>{const last=this.store.list('message',{tag:chat.id,limit:1})[0]?.value,avatar=this.store.get('avatar',chat.id)?.avatar||null;return {...chat,avatar,...(last?{lastMessage:last.kind==='protected'?'CIFER protected message':last.text||last.label||'Message'}:{})};}),cursor:filtered.length>limit?encodeCursor(page.at(-1)):null};
   }
   unread() {
     const stats=this.store.messageStats(),chats=[];let total=0;
@@ -108,7 +108,7 @@ export class Inbox {
   }
   read(chat, ids) {
     if(ids!==undefined&&(!Array.isArray(ids)||ids.length>100||ids.some(x=>typeof x!=='string')))throw Error('Invalid message selection.');
-    this.store.transaction(()=>{for(const {value:row} of this.store.list('message',{tag:chat,limit:MAX_MESSAGES}))if(!row.fromMe&&!row.readAt&&(!ids||ids.includes(row.id)))this.save({...row,readAt:Date.now()});});
+    this.store.transaction(()=>{for(const {value:row} of this.store.list('message',{tag:chat,limit:MAX_MESSAGES}))if(!row.fromMe&&!row.readAt&&(!ids||ids.includes(row.id)))this.save({...row,readAt:Date.now()},true);});
     return {ok:true};
   }
   rebind(old, chat) {
@@ -130,6 +130,7 @@ export class Inbox {
         this.store.set('operation',id,{...value,chat,request:undefined,state:value.state==='prepared'?'cancelled':value.state},{expires:value.expiresAt,created:value.createdAt,tag:value.messageId});
       }
       this.store.remove('contact-binding',old);
+      const avatar=this.store.get('avatar',old);if(avatar&&!this.store.get('avatar',chat))this.store.set('avatar',chat,avatar,{created:avatar.checkedAt,expires:avatar.expiresAt});this.store.remove('avatar',old);
       const setting=this.store.get('setting',old);if(setting&&!this.store.get('setting',chat))this.store.set('setting',chat,setting);this.store.remove('setting',old);
       const seed=this.store.get('history-seed',old);if(seed&&!this.store.get('history-seed',chat))this.store.set('history-seed',chat,{...seed,chat},{created:seed.createdAt,expires:seed.createdAt+WEEK});this.store.remove('history-seed',old);
       const previous=this.store.get('chat',old),canonical=this.store.get('chat',chat);if(previous){this.contact(chat,{...previous,...(canonical?.name&&canonical.name!=='WhatsApp contact'&&!canonical.name.startsWith('+')?{name:canonical.name}:{})});this.store.remove('chat',old);}
@@ -151,5 +152,5 @@ export class Inbox {
     for(const {value:row} of this.store.list('message',{expired:true,limit:MAX_MESSAGES}))this.tombstone(row);
     this.store.prune();this.trim();this.store.checkpoint();
   }
-  reset() { this.store.transaction(()=>{for(const ns of ['message','tombstone','retry','change','operation','operation-identity','chat','alias','setting','history','history-seed','contact-binding'])this.store.clear(ns);this.revision(null,'reset');});if(!this.store.depth)this.store.checkpoint(); }
+  reset() { this.store.transaction(()=>{for(const ns of ['message','tombstone','retry','change','operation','operation-identity','chat','alias','setting','history','history-seed','contact-binding','avatar'])this.store.clear(ns);this.revision(null,'reset');});if(!this.store.depth)this.store.checkpoint(); }
 }

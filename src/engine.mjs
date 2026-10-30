@@ -3,6 +3,7 @@ import pino from 'pino';
 import { Store } from './store.mjs';
 import { Inbox, decodeCursor } from './inbox.mjs';
 import { authStore } from './auth-store.mjs';
+import { Avatars } from './avatars.mjs';
 import { WEEK, assertPeer, canonicalJSON, digest, exact, extract, keyOf, messageId, normalizePeer, peerPattern, protectedWire, receipt, sanitizeMessage, strongest, uuidPattern, validateBinding, validatePrepared } from './content.mjs';
 
 const logger=pino({level:'silent'});
@@ -11,13 +12,14 @@ const safeClone=value=>JSON.parse(JSON.stringify(value));
 const METHODS=new Set(['status','pair','chats','messages','history','send','prepareSend','operation','operations','read','markRead','profiles','binding','bindContact','disconnect']);
 
 class Engine {
-  constructor({directory,key,account,connection,onEvent=()=>{},socketFactory=makeWASocket}) {
+  constructor({directory,key,account,connection,onEvent=()=>{},socketFactory=makeWASocket,avatarFetch=globalThis.fetch}) {
     if(typeof directory!=='string'||!directory||typeof account!=='string'||!account||account.length>200||typeof connection!=='string'||!connection||connection.length>200||typeof onEvent!=='function')throw Error('Invalid engine configuration.');
     this.account=account;this.connection=connection;this.emit=onEvent;this.factory=socketFactory;
     this.store=new Store(directory,key,{account,connection});this.closed=false;this.stopping=false;this.epoch=0;this.socket=null;this.timer=null;this.attempts=0;
     this.state='disconnected';this.qr=null;this.pairCode=null;this.pairExpiresAt=null;this.identity=this.store.get('system','identity')||null;
-    this.queue=Promise.resolve();this.queued=0;this.inflight=new Set();this.changedScheduled=false;this.pairBusy=false;this.pairWaiters=new Set();this.historyRequests=new Map();
-    this.inbox=new Inbox(this.store,chat=>this.changed(chat));
+    this.queue=Promise.resolve();this.queued=0;this.inflight=new Set();this.changedScheduled=false;this.metadataScheduled=false;this.pairBusy=false;this.pairWaiters=new Set();this.historyRequests=new Map();
+    this.inbox=new Inbox(this.store,(chat,metadata)=>metadata?this.metadata(chat):this.changed(chat));
+    this.avatars=new Avatars({store:this.store,socket:()=>this.socket,live:()=>!this.closed&&!this.stopping&&!this.closing&&this.state==='connected'&&!!this.socket,changed:chat=>this.metadata(chat),fetcher:avatarFetch});
     for(const {id,value}of this.store.list('operation'))if(value.state==='sending')this.store.set('operation',id,{...value,state:'uncertain'},{expires:value.expiresAt,created:value.createdAt,tag:value.messageId});
     this.inbox.prune();
     this.pruner=setInterval(()=>{if(this.closed)return;try{this.inbox.prune();}catch{this.pause('reconnect-required');}},60000);this.pruner.unref?.();
@@ -30,6 +32,10 @@ class Engine {
     if(this.changedScheduled||this.closed||this.stopping)return;this.changedScheduled=true;
     queueMicrotask(()=>{this.changedScheduled=false;if(!this.closed&&!this.stopping)this.event({type:'changed',revision:this.store.revision(),...(chat?{chat}:{})});});
   }
+  metadata(chat){
+    if(this.metadataScheduled||this.closed||this.stopping)return;this.metadataScheduled=true;
+    queueMicrotask(()=>{this.metadataScheduled=false;if(!this.closed&&!this.stopping)this.event({type:'metadata',...(chat?{chat}:{})});});
+  }
   enqueue(epoch,job){
     if(this.closed||this.stopping||epoch!==this.epoch)return;
     if(this.queued>=128){this.pause('reconnecting');this.scheduleReconnect();return;}
@@ -37,6 +43,7 @@ class Engine {
     this.queue=this.queue.then(async()=>{if(!this.closed&&!this.stopping&&epoch===this.epoch)await job();}).catch(()=>{if(!this.closed&&!this.stopping)this.event({type:'status',status:{...this.status(),error:'WhatsApp synchronization needs retry.'}});}).finally(()=>{this.queued--;});
   }
   pause(state='disconnected'){
+    this.avatars.pause();
     ++this.epoch;clearTimeout(this.timer);this.timer=null;const socket=this.socket;this.socket=null;this.state=state;this.qr=null;this.pairCode=null;this.pairExpiresAt=null;
     for(const finish of this.pairWaiters)finish(false);
     try{socket?.end(new Error('Local session paused'));}catch{}
@@ -106,7 +113,7 @@ class Engine {
     });
     this.statusChanged();return this.status();
   }
-  async contacts(rows){for(const row of rows.slice(0,10000)){const chat=await this.canonical(row.id||row.lid,row.phoneNumber);if(!chat)continue;this.inbox.contact(chat,{name:row.name||row.notify||row.verifiedName});}this.changed();}
+  async contacts(rows){for(const row of rows.slice(0,10000)){const chat=await this.canonical(row.id||row.lid,row.phoneNumber);if(!chat)continue;this.inbox.contact(chat,{name:row.name||row.notify||row.verifiedName});if(Object.hasOwn(row,'imgUrl'))this.avatars.invalidate(chat,row.imgUrl==='removed'||row.imgUrl===null);}this.metadata();}
   async chatSettings(rows){for(const row of rows.slice(0,10000)){const chat=await this.canonical(row.id,row.pnJid);if(!chat)continue;const updatedAt=Math.min(Date.now(),Number(row.conversationTimestamp||0)*1000);this.inbox.contact(chat,{...(row.name?{name:row.name}:{}),...(Number.isSafeInteger(updatedAt)?{updatedAt}:{})});if(row.ephemeralExpiration!==undefined){const seconds=Number(row.ephemeralExpiration);if(Number.isSafeInteger(seconds)&&seconds>=0)this.store.set('setting',chat,{seconds});}const seed=row.messages?.[0]?.message,key=seed?keyOf(seed.key):null,at=Number(seed?.messageTimestamp)*1000;if(key&&Number.isSafeInteger(at)&&at>Date.now()-WEEK)this.store.set('history-seed',chat,{...key,chat,createdAt:at},{expires:at+WEEK,created:at});}this.changed();}
   async ingest(values,history=false){for(const row of values){const chat=await this.canonical(row.chat,row.alternate);if(!chat)continue;const candidates=row.fromMe?this.store.list('operation',{tag:row.id,limit:100}).map(r=>r.value):[];let op=null;for(const candidate of candidates)if(await this.canonical(candidate.chat)===chat){op=candidate;break;}const target=op?op.chat:chat;this.inbox.ingest({...row,chat:target},{history,operationId:op?.operationId});if(op){const expiresAt=Math.min(op.expiresAt,row.expiresAt);this.store.set('operation',op.operationId,{...op,expiresAt},{expires:expiresAt,created:op.createdAt,tag:op.messageId});this.inbox.delivery({chat:target,id:row.id,fromMe:true},receipt(row.status)||'sent');}}}
   async pairingReady(socket,epoch){
@@ -190,7 +197,7 @@ class Engine {
     this.historyRequests.set(requestId,{chat,before:args.before,startedAt:Date.now(),state:'loading'});for(const [id,r]of this.historyRequests)if(Date.now()-r.startedAt>60000)this.historyRequests.delete(id);
     return {state:'loading'};
   }
-  async profiles(args){exact(args,['peers']);if(!Array.isArray(args.peers)||args.peers.length>20)throw Error('Invalid contact selection.');for(const peer of args.peers)await this.canonical(assertPeer(peer));return {ok:true};}
+  async profiles(args){exact(args,['peers']);if(!Array.isArray(args.peers)||args.peers.length>20)throw Error('Invalid contact selection.');const peers=[];for(const peer of args.peers)peers.push(await this.canonical(assertPeer(peer)));return this.avatars.request([...new Set(peers)]);}
   async request(method,args={}){
     this.active();if(!METHODS.has(method))throw Error('Unknown WhatsApp operation.');
     if(method==='status'){exact(args,[]);return this.status();}
@@ -218,7 +225,7 @@ class Engine {
   }
   async finishDisconnect(){
     this.active();this.store.set('system','auto-connect',false);const socket=this.socket;this.stopping=true;++this.epoch;clearTimeout(this.timer);this.timer=null;this.socket=null;this.state='disconnected';this.qr=null;this.pairCode=null;this.pairExpiresAt=null;let remoteUnlinked=false;
-    for(const finish of this.pairWaiters)finish(false);
+    this.avatars.pause();for(const finish of this.pairWaiters)finish(false);
     if(socket){try{remoteUnlinked=await bounded(Promise.resolve(socket.logout()).then(()=>true),3000,false);}catch{}}
     try{socket?.end(new Error('WhatsApp disconnected'));}catch{}
     await this.queue;this.store.transaction(()=>{this.store.clear('wa-auth');this.store.clear('wa-key');this.store.remove('system','identity');this.inbox.reset();});this.store.checkpoint();this.identity=null;this.historyRequests.clear();this.stopping=false;if(!this.closing)this.statusChanged();return {disconnected:true,remoteUnlinked};

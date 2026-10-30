@@ -67,17 +67,33 @@ When `remoteUnlinked` is false, the user can revoke the linked device in WhatsAp
 | `operation` | `{id}` | Recoverable operation or null |
 | `operations` | `{limit?}` | `{operations}`; default 50, max 100 |
 | `markRead` / `read` | `{chat,ids?}` | `{ok:true}`; local unread only, no WhatsApp receipt |
-| `profiles` | `{peers}` | `{ok:true}`; resolves known identities, does not download avatars |
+| `profiles` | `{peers}` | `{ok:true}`; schedules previews for at most 20 known chats while connected; work is bounded, deduplicated and asynchronous |
 | `binding` | `{chat}` | Local public CIFER-contact binding or null |
 | `bindContact` | `{chat,binding:null|object}` | `{ok:true}` |
 | `disconnect` | `{}` | `{disconnected:true,remoteUnlinked:boolean}` |
 
-Events are `{type:'status',status}` or `{type:'changed',revision,chat?}`. The host
+Events are `{type:'status',status}`, `{type:'changed',revision,chat?}` or
+`{type:'metadata',chat?}`. Photo/contact and local read-marker events refresh
+metadata without invalidating message content or sender-confirmation controls. The host
 adds its own generation. Missing QR/code values are null; missing pairing expiry
 is zero. Chat `lastMessage` is a string and protected content uses a placeholder.
 Messages contain `id`, `chat`, `kind`, `text` or `wire`, `fromMe`, `createdAt`,
 `expiresAt`, `delivery` and optional `operationId`. Page cursors are opaque strings
-or null. Unknown methods and extra request fields fail closed.
+or null. Chat `avatar` is null or a validated raster data URI, never a remote URL
+or filesystem path. Unknown methods and extra request fields fail closed.
+
+Profile previews use the linked WhatsApp socket to obtain a URL, then the helper
+downloads it without cookies, referrer or redirects. Only HTTPS subdomains of
+`whatsapp.net` and `whatsapp.com` are accepted. JPEG, PNG and WebP are checked for
+their actual container and dimensions (maximum 512×512, 32 KiB; no SVG/animation).
+The encrypted account/connection database caches at most 100 entries and 4 MiB,
+separately from message history. Photos expire after one hour; absent/private
+photos after ten minutes; transient failures after one minute. Expired cache is
+inaccessible immediately and pruned within one minute; the UI replaces its memory
+copy on refresh or clears it on lock/account change. Removed photos invalidate the
+cache immediately. Verified PN/LID mappings can move cache entries; no phone number
+is inferred from a LID. Two jobs run concurrently, with at most 40 queued/active.
+Pause/close aborts work and fences late completions; unlink erases the cache.
 
 ## Storage and delivery rules
 
@@ -126,7 +142,7 @@ and key opening is a separate trust boundary from ordinary local WhatsApp traffi
 V1 supports individual chats, ordinary text, protected wire transport, captions,
 contact names, phone/LID aliases, limited history, edits/deletes, disappearing
 expiry and delivery receipts. Media messages produce local placeholders. Groups,
-calls, reactions, status, attachment upload/download and profile-photo downloads
+calls, reactions, status and attachment upload/download
 are not implemented. No full WhatsApp-client parity is claimed.
 Ordinary outgoing text is limited to 2,000 UTF-8 bytes; incoming text/captions and
 protected wire records have their own bounded parsing limits.
