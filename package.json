@@ -1,0 +1,13 @@
+{
+  "name": "@cifer/whatsapp-core",
+  "version": "0.1.0",
+  "description": "Local, single-account WhatsApp engine for CIFER desktop",
+  "type": "module",
+  "license": "MIT",
+  "main": "src/index.mjs",
+  "exports": { ".": "./src/index.mjs" },
+  "files": ["src", "README.md", "LICENSE"],
+  "engines": { "node": ">=22.20.0" },
+  "scripts": { "test": "node --test test/*.test.mjs", "check": "node scripts/check.mjs", "audit:production": "npm audit --omit=dev" },
+  "dependencies": { "baileys": "7.0.0-rc14", "pino": "9.6.0" }
+}
