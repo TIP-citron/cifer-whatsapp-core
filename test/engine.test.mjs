@@ -84,4 +84,7 @@ test('every UUID bit contributes to WhatsApp ID and echoes cannot redirect into 
  assert.equal((await f.engine.request('messages',{chat:PEER})).messages[0].text,'FIRST');assert.ok(!(await f.engine.request('messages',{chat:other})).messages.some(m=>m.text==='FIRST'));
  socket.ev.emit('messages.upsert',{messages:[fixtureMessage(pa.messageId,'unrelated other chat',{key:{id:pa.messageId,remoteJid:other,fromMe:true}})]});await drain();
  assert.equal((await f.engine.request('messages',{chat:PEER})).messages[0].text,'FIRST');assert.ok((await f.engine.request('messages',{chat:other})).messages.some(m=>m.text==='unrelated other chat'&&!m.operationId));
+ socket.ev.emit('messages.upsert',{messages:[fixtureMessage(pa.messageId,'incoming reused id',{key:{id:pa.messageId,remoteJid:other,fromMe:false},status:4})]});
+ socket.ev.emit('messages.update',[{key:{id:pa.messageId,remoteJid:other,fromMe:false},update:{status:4}}]);await drain();
+ assert.equal((await f.engine.request('operation',{id:a.operationId})).state,'sent');assert.equal((await f.engine.request('messages',{chat:PEER})).messages[0].text,'FIRST');assert.ok((await f.engine.request('messages',{chat:other})).messages.some(m=>m.text==='incoming reused id'&&!m.operationId));
 });
