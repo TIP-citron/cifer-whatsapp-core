@@ -24,7 +24,7 @@ an administrator, a compromised native host, or a malicious software update.
 
 No listener, cloud token, arbitrary URL operation, generic decryption operation,
 filesystem request or shell command is exposed. Requests reject extra fields and
-validate peer IDs and sizes. Only individual WhatsApp chats are supported.
+validate peer IDs and sizes. Direct and existing group conversations are supported; protected recipient bindings remain individual-only. Group authorship and receipt identity are distinct from conversation identity.
 
 Profile photos are a separate bounded download path: only already-known chats
 can schedule a WhatsApp preview query. Its returned URL must be HTTPS on a
@@ -81,3 +81,16 @@ proof that a dependency has no vulnerabilities.
 For a suspected vulnerability, share a minimal synthetic reproduction with the
 maintainer through an agreed private channel. Do not include real WhatsApp
 credentials, message contents, pairing material or a storage database/key.
+
+Group read/delivery evidence is per recipient. Participant PN/LID aliases cannot
+merge group conversations or grant CIFER access. Admin-revoke role evidence is
+bound to a unique helper session and lifecycle epoch, preventing stale persisted
+roles from authorizing mutations after restart. Unknown historical authorization
+is deferred. Group discovery, metadata fetches, history ingestion and read/archive
+callbacks retain their original generation across every awaited stage.
+
+Encrypted synchronization metadata contains no bodies/media/Signal secrets and
+may survive body expiry to support older-chat archive operations. It has separate
+hard bounds and is erased on unlink. Archived unread rows are retained but omitted
+from all notification and badge summaries. No archive operation implicitly reads
+a conversation; uncertain archive changes are never automatically replayed.

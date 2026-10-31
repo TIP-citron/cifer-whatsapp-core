@@ -1,6 +1,6 @@
 import { createDecipheriv, hkdfSync } from 'node:crypto';
 import { proto } from 'baileys';
-import { WEEK, extract, keyOf, normalizePeer, peerPattern } from './content.mjs';
+import { WEEK, extract, keyOf, normalizePeer, peerPattern, isGroup } from './content.mjs';
 
 export const editAuthors = values => [...new Set(values.map(normalizePeer).filter(v=>peerPattern.test(v)))].slice(0,4);
 export function encryptedEdit(message, now=Date.now()) {
@@ -15,7 +15,7 @@ export function encryptedEdit(message, now=Date.now()) {
   const seal=body?.secretEncryptedMessage;
   if(seal?.secretEncType!==2||!Object.hasOwn(seal,'secretEncType')||!/^[-\w]{1,128}$/.test(seal.targetMessageKey?.id||'')||!(seal.encPayload instanceof Uint8Array)||seal.encPayload.length<17||seal.encPayload.length>65536||!(seal.encIv instanceof Uint8Array)||seal.encIv.length!==12)return null;
   // Only the authenticated transport envelope chooses the conversation/direction.
-  return {...key,authors:editAuthors([key.chat,key.alternate]),id:seal.targetMessageKey.id,at,payload:Buffer.from(seal.encPayload).toString('base64'),iv:Buffer.from(seal.encIv).toString('hex')};
+  return {...key,authors:editAuthors(isGroup(key.chat)?[key.participant,key.participantAlt]:[key.chat,key.alternate]),id:seal.targetMessageKey.id,at,payload:Buffer.from(seal.encPayload).toString('base64'),iv:Buffer.from(seal.encIv).toString('hex')};
 }
 export function decryptEdit(seal, secretHex, authors, now=Date.now()) {
   if(!/^[a-f0-9]{64}$/.test(secretHex||''))return null;

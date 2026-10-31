@@ -1,6 +1,6 @@
-import { assertPeer, canonicalJSON, digest, exact, extract, WEEK, messageActions, messageId, protectedWire, uuidPattern } from './content.mjs';
+import { assertChat, isGroup, peerPattern, canonicalJSON, digest, exact, extract, WEEK, messageActions, messageId, protectedWire, uuidPattern } from './content.mjs';
 
-const keyOfInput = input => ({chat:input.chat,id:input.messageId,fromMe:input.fromMe});
+const keyOfInput = input => ({chat:input.chat,id:input.messageId,fromMe:input.fromMe,...(input.participant?{participant:input.participant}:{})});
 const copy = value => JSON.parse(JSON.stringify(value));
 const pending = new Set(['prepared','sending','uncertain']);
 
@@ -11,9 +11,11 @@ export class Mutations {
     for(const {id,value} of this.store.list('mutation')) if(value.state==='sending') this.save({...value,state:'uncertain',request:undefined});
   }
   input(value) {
-    exact(value,['operationId','chat','messageId','fromMe','action','expectedVersion'],['text','kind','prepared']);
+    exact(value,['operationId','chat','messageId','fromMe','action','expectedVersion'],['text','kind','prepared','participant']);
     if(!uuidPattern.test(value.operationId)||!/^[\w-]{1,128}$/.test(value.messageId)||typeof value.fromMe!=='boolean'||!['edit','delete-everyone','delete-local'].includes(value.action)||!/^[a-f0-9]{64}$/.test(value.expectedVersion)) throw Error('Invalid message action.');
-    assertPeer(value.chat);
+    assertChat(value.chat);
+    if(isGroup(value.chat)&&!peerPattern.test(value.participant||'')||value.participant!==undefined&&!peerPattern.test(value.participant))throw Error('Invalid message author.');
+    if(isGroup(value.chat)&&value.kind==='protected')throw Error('Protected group messages are not available.');
     if(value.action==='edit') {
       if(!value.fromMe) throw Error('Only your own messages can be edited.');
       this.engine.sendInput({operationId:value.operationId,chat:value.chat,text:value.text,kind:value.kind,...(value.prepared!==undefined?{prepared:value.prepared}:{})});
@@ -21,10 +23,10 @@ export class Mutations {
     return copy(value);
   }
   view(row) {
-    return {operationId:row.operationId,chat:row.chat,messageId:row.targetId,fromMe:row.fromMe,action:row.action,state:row.state==='sending'?'queued':row.state,
+    return {operationId:row.operationId,chat:row.chat,messageId:row.targetId,fromMe:row.fromMe,...(row.participant?{participant:row.participant}:{}),action:row.action,state:row.state==='sending'?'queued':row.state,
       ...(row.state==='prepared'&&row.request?{request:copy(row.request)}:{})};
   }
-  save(row) { this.store.set('mutation',row.operationId,row,{expires:row.expiresAt,created:row.createdAt,tag:messageId({chat:row.chat,id:row.targetId,fromMe:row.fromMe})}); }
+  save(row) { this.store.set('mutation',row.operationId,row,{expires:row.expiresAt,created:row.createdAt,tag:messageId({chat:row.chat,id:row.targetId,fromMe:row.fromMe,participant:row.participant})}); }
   list(chat) { return this.store.list('mutation',{limit:10000}).map(r=>r.value).filter(r=>r.chat===chat&&pending.has(r.state)).slice(0,100).map(r=>this.view(r)); }
   target(input) {
     const row=this.store.get('message',messageId(keyOfInput(input))),now=Date.now();
@@ -50,7 +52,7 @@ export class Mutations {
     const target=this.target(input),tag=messageId(target);
     if(input.action!=='delete-local'&&this.store.list('mutation',{tag}).some(r=>pending.has(r.value.state))) throw Error('An earlier change is not confirmed. Check this message on your phone.');
     if(this.store.totals('mutation').count>=10000) throw Error('Local operation storage is full.');
-    const row={operationId:input.operationId,chat:input.chat,targetId:input.messageId,fromMe:input.fromMe,action:input.action,digest:hash,...(input.action==='edit'?{contentDigest:digest(input.text)}:{}),request:input,state:'prepared',
+    const row={operationId:input.operationId,chat:input.chat,targetId:input.messageId,fromMe:input.fromMe,...(input.participant?{participant:input.participant}:{}),action:input.action,digest:hash,...(input.action==='edit'?{contentDigest:digest(input.text)}:{}),request:input,state:'prepared',
       networkId:'3EB0'+digest('mutation:'+input.operationId).slice(0,28).toUpperCase(),createdAt:Date.now(),expiresAt:target.expiresAt};
     this.inbox.trim(Buffer.byteLength(JSON.stringify(row))+512);
     this.store.transaction(()=>{this.store.set('mutation-identity',row.operationId,{digest:hash,view:this.view({...row,request:undefined})},{expires:row.expiresAt+WEEK});this.save(row);});
@@ -64,12 +66,13 @@ export class Mutations {
     try { this.target(input); }
     catch { row={...row,state:'cancelled',request:undefined};this.save(row);engine.changed(row.chat);return this.view(row); }
     if(input.action!=='delete-local'&&(engine.state!=='connected'||!socket)) throw Error('Reconnect WhatsApp before changing this message.');
+    if(isGroup(input.chat)&&input.action!=='delete-local'){await engine.groups.authorizeSend(input.chat);if(engine.closed||engine.stopping||engine.closing||engine.epoch!==epoch)throw Error('WhatsApp connection changed.');this.target(input);}
     row={...row,state:'sending'};this.save(row);engine.changed(row.chat);
     if(input.action==='delete-local') {
       this.store.transaction(()=>{this.inbox.tombstone(keyOfInput(input));row={...row,state:'sent',request:undefined};this.save(row);});
       return this.view(row);
     }
-    const key={remoteJid:row.chat,id:row.targetId,fromMe:true};
+    const target=this.target(input),key={remoteJid:row.chat,id:row.targetId,fromMe:true,...(isGroup(row.chat)?{participant:target.protocolKey?.participant||row.participant}: {})};
     const job=(async()=>{
       try {
         const options={messageId:row.networkId},setting=this.store.get('setting',row.chat);

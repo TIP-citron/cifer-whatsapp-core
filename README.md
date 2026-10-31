@@ -60,14 +60,16 @@ When `remoteUnlinked` is false, the user can revoke the linked device in WhatsAp
 | --- | --- | --- |
 | `status` | `{}` | State, identity, QR/code, expiry, connection, revision and content-free unread counts |
 | `pair` | `{phone?}` | Status; phone includes country code, digits only. First phone request waits up to 10 seconds for readiness, then up to 10 seconds for a code. Refreshing expired pairing restarts the unregistered socket. |
-| `chats` | `{before?,limit?}` | `{chats,cursor}`; default 10, max 100 |
+| `chats` | `{view?:"active"|"archived",before?,limit?}` | `{chats,cursor}`; default 10, max 100 |
+| `chat` | `{chat}` | Single conversation summary, independent of active/archived pagination |
+| `setArchived` | `{chat,archived,operationId}` | `{chat,archived,operationId,state:"sent"|"uncertain"}`; requires connected app-state readiness; uncertain operations are never replayed |
 | `messages` | `{chat,before?,limit?}` | `{messages,cursor}`; default 20, max 100 |
 | `history` | `{chat,before?}` | `{state:'loading'|'ready'|'unavailable',hasMore?}`; phone fetches at most 20 per request |
 | `prepareSend` | `{operationId,chat,text,kind,prepared?}` | Durable prepared operation; does not publish or send |
 | `send` | Same immutable arguments | Operation state and stable WhatsApp message ID |
 | `operation` | `{id}` | Recoverable operation or null |
 | `operations` | `{limit?}` | `{operations}`; default 50, max 100 |
-| `markRead` / `read` | `{chat,ids?}` | `{ok:true}`; local unread only, no WhatsApp receipt |
+| `markRead` / `read` | `{chat,messages?:[{id,fromMe,participant?}],onlyIfUnarchived?}` | `{ok:true}`; visible-message receipts and durable, bounded read sync; legacy `ids` accepted only for direct chats |
 | `profiles` | `{peers}` | `{ok:true}`; schedules previews for at most 20 known chats while connected; work is bounded, deduplicated and asynchronous |
 | `binding` | `{chat}` | Local public CIFER-contact binding or null |
 | `bindContact` | `{chat,binding:null|object}` | `{ok:true}` |
@@ -211,3 +213,37 @@ edits create a content-free tombstone. Messages processed by older CIFER builds
 may lack this secret; an upgrade cannot recover a previously discarded edit unless
 WhatsApp supplies the relevant history again. Fresh native-client edits must be
 verified on the signed candidate before release.
+
+## Existing groups and archive
+
+Group conversations preserve authenticated participant identity independently of the
+conversation. Group message references include participant; direct-chat identifiers
+remain compatible. Sender labels are display data, never authority. Discovery is
+bounded and histories are loaded lazily. Membership/announcement permissions are
+refreshed before transmission; group creation and administration are not exposed.
+Group receipts count distinct recipients (Delivered to N / Read by N), never infer
+that all members read a message. Edits require the original author. Administrator
+revokes without historical authorization evidence remain deferred rather than
+modifying another member's content using a lossy event.
+
+Extra CIFER protection remains direct-chat-only. Protected group payloads are
+retained as opaque protected messages for an explicit unsupported/locked display;
+they do not authorize a group recipient binding or automatic key-service access.
+
+Archived chats keep their own unread state but are absent from global notification
+counts. The active/archived filter is applied before pagination. The account's
+WhatsApp keep-archived preference remains authoritative. Archiving does not mark
+read, delete content or alter mute settings. Offline or incomplete-range actions
+fail safely; ambiguous patches are reconciled rather than automatically replayed.
+
+Content-free encrypted protocol ranges (keys, timestamps, participants) may outlive
+message bodies. They are capped at 128 per chat / 10,000 overall; incompleteness is
+explicit and refresh never restores expired content. Group roster caches are
+bounded to 20 groups / 10,000 participants / 24 hours. Disconnect clears these
+namespaces. Message content still follows the existing seven-day/10,000/64-MiB
+limits and earlier disappearing-message deadlines. Read receipts apply only to
+selected visible messages; whole-chat read synchronization uses a verified cutoff
+and never clears a newer arrival.
+
+These source changes require packaged, real-account qualification before a public
+Mac release. Synthetic fixtures alone are not proof of live WhatsApp behavior.

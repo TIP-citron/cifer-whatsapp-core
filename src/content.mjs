@@ -2,6 +2,9 @@ import { createHash } from 'node:crypto';
 
 export const WEEK = 604800000, MAX_MESSAGES = 10000, MAX_BYTES = 64 * 1024 * 1024;
 export const peerPattern = /^\d{5,24}@(s\.whatsapp\.net|lid)$/;
+export const groupPattern = /^\d{5,30}(?:-\d{5,20})?@g\.us$/;
+export const isGroup = value => typeof value === 'string' && groupPattern.test(value);
+export function assertChat(value) { const chat=normalizePeer(value); if (!peerPattern.test(chat)&&!isGroup(chat)) throw Error('Choose a WhatsApp chat.'); return chat; }
 export const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 export const normalizePeer = value => typeof value === 'string' ? value.replace(/:\d+@/, '@') : '';
 export const digest = value => createHash('sha256').update(value).digest('hex');
@@ -12,10 +15,16 @@ export function exact(value, keys, optional = []) {
 }
 export function keyOf(key) {
   const chat = normalizePeer(key?.remoteJid), id = key?.id;
-  if (!peerPattern.test(chat) || typeof id !== 'string' || !/^[\w-]{1,128}$/.test(id) || typeof key.fromMe !== 'boolean') return null;
+  if ((!peerPattern.test(chat)&&!isGroup(chat)) || typeof id !== 'string' || !/^[\w-]{1,128}$/.test(id) || typeof key.fromMe !== 'boolean') return null;
+  if (isGroup(chat)) {
+    const participant=normalizePeer(key.participant),participantAlt=normalizePeer(key.participantAlt);
+    if ((!participant&&!key.fromMe)||(participant&&!peerPattern.test(participant))||(participantAlt&&!peerPattern.test(participantAlt))) return null;
+    const protocolKey={remoteJid:chat,id,fromMe:key.fromMe,...(participant?{participant}:{}),...(participantAlt?{participantAlt}:{})};
+    return {chat,id,fromMe:key.fromMe,...(participant?{participant}:{}),...(participantAlt?{participantAlt}:{}),protocolKey};
+  }
   return { chat, id, fromMe: key.fromMe, alternate: normalizePeer(key.remoteJidAlt) };
 }
-export const messageId = key => JSON.stringify([key.chat, key.id, key.fromMe]);
+export const messageId = key => JSON.stringify(isGroup(key.chat)?[key.chat,key.id,key.fromMe,key.participant||'']:[key.chat,key.id,key.fromMe]);
 export function protectedWire(value) {
   if (typeof value !== 'string' || Buffer.byteLength(value) > 16384 || !/^CIFER:WA:[12]:/.test(value)) throw Error('Invalid protected message.');
   const version = Number(value[9]), encoded = value.slice(11).split('\n')[0], decoded = Buffer.from(encoded, 'base64');
@@ -70,10 +79,17 @@ export function sanitizeMutation(message, now = Date.now()) {
     if (!/^[\w-]{1,128}$/.test(protocol.key?.id || '')) return null;
     // The authenticated envelope owns peer/direction. Never route by a sender-supplied key.
     key.id = protocol.key.id;
+    if(isGroup(key.chat)) {
+      if(protocol.key.remoteJid&&normalizePeer(protocol.key.remoteJid)!==key.chat)return null;
+      const targetParticipant=normalizePeer(protocol.key.participant),targetParticipantAlt=normalizePeer(protocol.key.participantAlt);
+      if(targetParticipant&&!peerPattern.test(targetParticipant)||targetParticipantAlt&&!peerPattern.test(targetParticipantAlt))return null;
+      key.targetParticipant=targetParticipant||undefined;key.targetParticipantAlt=targetParticipantAlt||undefined;
+      key.targetFromMe=typeof protocol.key.fromMe==='boolean'?protocol.key.fromMe:undefined;
+    }
   }
   const at = protocol?.timestampMs ? Number(protocol.timestampMs) : Number(message.messageTimestamp) * 1000;
   if (!Number.isSafeInteger(at) || at <= now - WEEK || at > now + 60000) return null;
-  return { ...key, removed, at, envelope:!!protocol, ...(!removed ? { content: extract(protocol ? protocol.editedMessage : body) } : {}) };
+  return { ...key, removed, at, ...(isGroup(key.chat)?{envelopeAt:Number(message.messageTimestamp)*1000}:{}), envelope:!!protocol, ...(!removed ? { content: extract(protocol ? protocol.editedMessage : body) } : {}) };
 }
 function originalEditSecret(message) {
   let body=message.message,secret=message.messageSecret;
@@ -88,8 +104,10 @@ function originalEditSecret(message) {
 export function sanitizeMessage(message, now = Date.now()) {
   const key = keyOf(message.key), createdAt = Number(message.messageTimestamp) * 1000;
   if (!key || !Number.isSafeInteger(createdAt) || createdAt <= now - WEEK || createdAt > now + 60000) return null;
-  const body = extract(message.message); if (!body) return null;
+  let body = extract(message.message); if (!body) return null;
   const mutation = sanitizeMutation(message, now);
+  // Folded group mutations have lost the authenticated actor; never accept their body as an original.
+  if(isGroup(key.chat)&&mutation&&!mutation.envelope)return null;
   const earliestCreatedAt = mutation && !mutation.envelope ? createdAt - EDIT_WINDOW : createdAt;
   const expiresAt = Math.min(earliestCreatedAt + WEEK, body.expiration ? earliestCreatedAt + body.expiration * 1000 : Infinity, body.protectedCreatedAt ? body.protectedCreatedAt + WEEK : Infinity);
   if (expiresAt <= now) return null;
@@ -121,7 +139,7 @@ export function validatePrepared(value, account, chat, wire) {
 export const EDIT_WINDOW = 15 * 60 * 1000;
 // Conservative two-day eligibility; WhatsApp remains authoritative for acceptance.
 export const DELETE_WINDOW = 48 * 60 * 60 * 1000;
-export const messageVersion = row => digest(canonicalJSON([row.chat,row.id,row.fromMe,row.createdAt,row.expiresAt,row.kind,row.text??null,row.wire??null,row.label??null,row.editedAt??null]));
+export const messageVersion = row => digest(canonicalJSON([row.chat,row.id,row.fromMe,row.createdAt,row.expiresAt,row.kind,row.text??null,row.wire??null,row.label??null,row.editedAt??null,...(isGroup(row.chat)?[row.participant||'']:[])]));
 export function messageActions(row, now = Date.now()) {
   const sent = ['sent','delivered','read'].includes(row.delivery), own = row.fromMe && sent && row.expiresAt > now;
   return { version: messageVersion(row), editUntil: own && !row.label && ['ordinary','protected'].includes(row.kind) ? Math.min(row.createdAt + EDIT_WINDOW,row.expiresAt) : 0,

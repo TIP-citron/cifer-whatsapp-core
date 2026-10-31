@@ -1,22 +1,24 @@
-import { WEEK, MAX_BYTES, MAX_MESSAGES, EDIT_WINDOW, messageId, messageActions, digest, extract, receipt, strongest } from './content.mjs';
+import { WEEK, MAX_BYTES, MAX_MESSAGES, EDIT_WINDOW, messageId, messageActions, digest, extract, receipt, strongest, isGroup, peerPattern } from './content.mjs';
 
-const compare = (a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id);
-export const encodeCursor = row => Buffer.from(JSON.stringify([row.createdAt ?? row.updatedAt, row.id])).toString('base64url');
+const compare = (a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id) || (isGroup(a.chat)?messageId(b).localeCompare(messageId(a)):0);
+const chatView = row => { const {sendRestriction,...value}=row; return {...value,kind:isGroup(row.id)?'group':'direct',archived:row.archived===true,canSend:isGroup(row.id)?row.canSend===true:row.canSend!==false,...(typeof sendRestriction==='string'&&sendRestriction?{sendRestriction}:{})}; };
+const identity = key => ({chat:key.chat,id:key.id,fromMe:key.fromMe,...(key.participant?{participant:key.participant}:{})});
+export const encodeCursor = row => Buffer.from(JSON.stringify([row.createdAt ?? row.updatedAt, row.id,...(isGroup(row.chat)?[row.fromMe,row.participant||'']:[])])).toString('base64url');
 export function decodeCursor(value) {
   if (value == null) return null;
   if (typeof value !== 'string' || value.length > 512) throw Error('Invalid history cursor.');
   let result; try { result = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')); } catch { throw Error('Invalid history cursor.'); }
-  if (!Array.isArray(result) || result.length !== 2 || !Number.isSafeInteger(result[0]) || typeof result[1] !== 'string' || result[1].length > 128) throw Error('Invalid history cursor.');
+  if (!Array.isArray(result) || ![2,4].includes(result.length) || !Number.isSafeInteger(result[0]) || typeof result[1] !== 'string' || result[1].length > 128 || result.length===4&&(typeof result[2]!=='boolean'||!peerPattern.test(result[3]))) throw Error('Invalid history cursor.');
   return result;
 }
 const pageLimit = (value, fallback) => { const limit = value ?? fallback; if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw Error('Invalid page size.'); return limit; };
 
 export class Inbox {
-  constructor(store, changed, limits = {}) { this.store = store; this.changed = changed; this.maxMessages=Math.min(MAX_MESSAGES,limits.maxMessages??MAX_MESSAGES);this.maxBytes=Math.min(MAX_BYTES,limits.maxBytes??MAX_BYTES);
+  constructor(store, changed, limits = {}, removed = () => {}) { this.store = store; this.changed = changed; this.removed = removed; this.maxMessages=Math.min(MAX_MESSAGES,limits.maxMessages??MAX_MESSAGES);this.maxBytes=Math.min(MAX_BYTES,limits.maxBytes??MAX_BYTES);
     // Older candidates sometimes passed a complete message to tombstone(). Strip
     // any retained content while preserving deletion identity on upgrade.
     if(!store.get('system','content-free-tombstones-v1')) store.transaction(()=>{
-      for(const {id,value} of store.list('tombstone')) store.set('tombstone',id,{chat:value.chat,id:value.id,fromMe:value.fromMe,deleted:true},{expires:Date.now()+WEEK,created:Date.now(),tag:value.chat});
+      for(const {id,value} of store.list('tombstone')) store.set('tombstone',id,{...identity(value),deleted:true},{expires:Date.now()+WEEK,created:Date.now(),tag:value.chat});
       store.set('system','content-free-tombstones-v1',true);
     });
     // Earlier versions saved READ delivery from another linked device without
@@ -33,9 +35,9 @@ export class Inbox {
     this.changed(chat,metadata); return revision;
   }
   contact(chat, value = {}) {
-    const old = this.store.get('chat', chat) || { id: chat, name: chat.endsWith('@s.whatsapp.net') ? '+' + chat.split('@')[0] : 'WhatsApp contact', updatedAt: 0 };
+    const old = this.store.get('chat', chat) || { id: chat, name: chat.endsWith('@s.whatsapp.net') ? '+' + chat.split('@')[0] : isGroup(chat)?'WhatsApp group':'WhatsApp contact', kind:isGroup(chat)?'group':'direct', archived:false, updatedAt: 0 };
     const name = typeof value.name === 'string' && value.name.trim() ? value.name.slice(0, 120) : old.name;
-    const row = { ...old, ...value, id: chat, name, updatedAt: Math.max(old.updatedAt || 0, value.updatedAt || 0) };
+    const row = { ...old, ...Object.fromEntries(Object.entries(value).filter(([,v])=>v!==undefined)), id: chat, kind:isGroup(chat)?'group':'direct', name, updatedAt: Math.max(old.updatedAt || 0, value.updatedAt || 0) };
     if (chat.endsWith('@s.whatsapp.net')) row.phone = '+' + chat.split('@')[0];
     this.store.set('chat', chat, row, { created: row.updatedAt }); return row;
   }
@@ -44,7 +46,7 @@ export class Inbox {
     if (clean.expiresAt <= now || clean.createdAt <= now - WEEK || this.store.get('tombstone', id)) return false;
     const expiredEdit=this.store.get('encrypted-edit',id,0);
     if(expiredEdit?.expiresAt<=now){this.tombstone(clean);return false;}
-    const old = this.store.get('message', id), state = receipt(clean.status) || 'sent';
+    const old = this.store.get('message', id), state = isGroup(clean.chat)&&clean.fromMe?'sent':receipt(clean.status) || 'sent';
     const pendingRead=this.store.get('read-receipt',id), knownRead=state==='read'||!!pendingRead;
     if (old) {
       if(!old.editSecret&&clean.editSecret){old.editSecret=clean.editSecret;this.save(old);this.trim();}
@@ -56,30 +58,31 @@ export class Inbox {
       if(pendingRead)this.store.remove('read-receipt',id);
       return false;
     }
-    const row = { id: clean.id, chat: clean.chat, fromMe: clean.fromMe, createdAt: clean.createdAt, expiresAt: clean.expiresAt,
+    const row = { ...identity(clean), ...(clean.participantAlt?{participantAlt:clean.participantAlt}:{}), ...(clean.protocolKey?{protocolKey:clean.protocolKey}:{}), ...(isGroup(clean.chat)&&clean.name?{senderName:clean.name}:{}), createdAt: clean.createdAt, expiresAt: clean.expiresAt,
       kind: clean.kind, ...(clean.text !== undefined ? { text:clean.text } : {}), ...(clean.wire ? { wire:clean.wire } : {}), ...(clean.label ? { label:clean.label } : {}),
       editSecret:clean.editSecret, delivery: knownRead ? 'read' : state, readAt: clean.fromMe || history || knownRead ? now : null, editedAt: clean.editedAt || null, ...(operationId ? { operationId } : {}) };
-    this.store.transaction(() => { this.save(row); if(pendingRead)this.store.remove('read-receipt',id); this.contact(row.chat, { updatedAt: row.createdAt, ...(!row.fromMe && clean.name ? { name:clean.name } : {}) });
+    this.store.transaction(() => { this.save(row); if(pendingRead)this.store.remove('read-receipt',id); this.contact(row.chat, { updatedAt: row.createdAt, ...(!isGroup(row.chat)&&!row.fromMe && clean.name ? { name:clean.name } : {}) });
       const pending = this.store.get('pending-edit', id);
       if (pending) { this.edit(row, { normalizedContent: pending.content }, pending.at); this.store.remove('pending-edit', id); }
     });
     this.trim(); return true;
   }
   save(row, metadata = false) {
-    row.revision = this.revision(row.chat, metadata?'metadata':'upsert', { id:row.id }, metadata);
+    row.revision = this.revision(row.chat, metadata?'metadata':'upsert', { id:row.id,...(row.participant?{participant:row.participant}:{}) }, metadata);
     this.store.set('message', messageId(row), row, { expires:row.expiresAt, created:row.createdAt, tag:row.chat, unread:!row.fromMe&&!row.readAt });
   }
   tombstone(key, now = Date.now(), mutationId) {
     const id = messageId(key);
     this.store.transaction(() => {
       this.store.remove('message', id); this.store.remove('read-receipt', id); this.store.remove('retry', id); this.store.remove('pending-edit', id); this.store.remove('encrypted-edit', id);
-      this.store.set('tombstone', id, { chat:key.chat, id:key.id, fromMe:key.fromMe, deleted:true }, { expires:now + WEEK, created:now, tag:key.chat });
+      for(const {id:receiptId} of this.store.list('group-receipt',{tag:id,limit:10000}))this.store.remove('group-receipt',receiptId);
+      this.store.set('tombstone', id, { ...identity(key), deleted:true }, { expires:now + WEEK, created:now, tag:key.chat });
       for (const {id:opId,value} of this.store.list('operation', {tag:key.id})) {
         if(!key.fromMe||value.chat!==key.chat)continue;
         const next={...value,request:undefined,deleted:true,state:value.state==='prepared'?'cancelled':value.state}; this.store.set('operation',opId,next,{expires:value.expiresAt,created:value.createdAt,tag:key.id});
       }
-      this.resolveMutations(key, null, mutationId);
-      this.revision(key.chat, 'delete', { id:key.id });
+      this.resolveMutations(key, null, mutationId);this.removed(key);
+      this.revision(key.chat, 'delete', { id:key.id,...(key.participant?{participant:key.participant}:{}) });
     });
   }
   edit(key, body, editedAt, mutationId) {
@@ -94,7 +97,7 @@ export class Inbox {
       const earliestCreatedAt = editedAt - EDIT_WINDOW;
       const expires = Math.min(now+120000, earliestCreatedAt+WEEK, content.expiration?earliestCreatedAt+content.expiration*1000:Infinity, content.protectedCreatedAt?content.protectedCreatedAt+WEEK:Infinity);
       if(expires<=now){this.tombstone(key);return;}
-      this.store.set('pending-edit', id, { chat:key.chat,id:key.id,fromMe:key.fromMe,content,at:editedAt }, { expires, created:editedAt, tag:key.chat });
+      this.store.set('pending-edit', id, { ...identity(key),content,at:editedAt,expiresAt:expires }, { expires, created:editedAt, tag:key.chat });
       return;
     }
     if (editedAt <= (old.editedAt || 0)) return;
@@ -125,6 +128,7 @@ export class Inbox {
     }
   }
   delivery(key, state) {
+    if(isGroup(key.chat)&&key.fromMe)state='sent';
     const id=messageId(key),old=this.store.get('message',id);
     if (old) {
       const delivery=strongest(old.delivery,state), readAt=old.readAt||(!old.fromMe&&state==='read'?Date.now():null);
@@ -134,7 +138,7 @@ export class Inbox {
       // A phone receipt can precede the message or an alias mapping. Keep only
       // bounded, encrypted identity metadata until the message arrives.
       if(this.store.totals('read-receipt').count>=MAX_MESSAGES)throw Error('Read synchronization storage is full.');
-      const readAt=Date.now();this.store.set('read-receipt',id,{chat:key.chat,id:key.id,fromMe:false,readAt},{created:readAt,expires:readAt+WEEK,tag:key.chat});
+      const readAt=Date.now();this.store.set('read-receipt',id,{...identity(key),readAt},{created:readAt,expires:readAt+WEEK,tag:key.chat});
     }
     for(const {id:opId,value} of this.store.list('operation',{tag:key.id})) {
       if(!key.fromMe||value.chat!==key.chat)continue;
@@ -144,36 +148,106 @@ export class Inbox {
       }
     }
   }
+  groupReceipt(key, recipient, state) {
+    if(!isGroup(key.chat)||!key.fromMe||!peerPattern.test(key.participant||'')||!peerPattern.test(recipient)||!['delivered','read'].includes(state))return;
+    const target=messageId(key);if(this.store.get('tombstone',target))return;
+    const id=JSON.stringify([target,recipient]),old=this.store.get('group-receipt',id),message=this.store.get('message',target);
+    if(!old&&this.store.totals('group-receipt').count>=MAX_MESSAGES)return;
+    const expiresAt=Math.min(message?.expiresAt||Date.now()+WEEK,old?.expiresAt||Infinity),delivery=strongest(old?.delivery,state);
+    if(old?.delivery===delivery)return;
+    this.store.set('group-receipt',id,{...identity(key),recipient,delivery,expiresAt},{expires:expiresAt,created:Date.now(),tag:target});
+    this.revision(key.chat,'metadata',{id:key.id,participant:key.participant},true);
+  }
+  receiptCounts(key) {
+    if(!isGroup(key.chat)||!key.fromMe)return {};
+    const rows=this.store.list('group-receipt',{tag:messageId(key),limit:MAX_MESSAGES});
+    return {deliveredCount:rows.length,readCount:rows.filter(r=>r.value.delivery==='read').length};
+  }
   messages(chat, args = {}) {
     const before=decodeCursor(args.before),limit=pageLimit(args.limit,20),now=Date.now();
     let rows=this.store.list('message',{tag:chat,now,limit:MAX_MESSAGES}).map(r=>r.value).filter(r=>r.createdAt>now-WEEK&&r.expiresAt>now).sort(compare);
     // Prepared protected sends survive a crash before publication/network transmission.
     for (const {value:op} of this.store.list('operation',{limit:MAX_MESSAGES})) {
       if (op.chat!==chat||!op.request||op.deleted||rows.some(m=>m.id===op.messageId)||!['prepared','sending','uncertain'].includes(op.state)) continue;
-      rows.push({id:op.messageId,chat,fromMe:true,kind:op.request.kind,...(op.request.kind==='protected'?{wire:op.request.text}:{text:op.request.text}),createdAt:op.createdAt,expiresAt:op.expiresAt,delivery:op.state==='uncertain'?'uncertain':'queued',operationId:op.operationId});
+      rows.push({id:op.messageId,chat,fromMe:true,...(op.participant?{participant:op.participant}:{}),kind:op.request.kind,...(op.request.kind==='protected'?{wire:op.request.text}:{text:op.request.text}),createdAt:op.createdAt,expiresAt:op.expiresAt,delivery:op.state==='uncertain'?'uncertain':'queued',operationId:op.operationId});
     }
-    rows.sort(compare);if(before)rows=rows.filter(r=>r.createdAt<before[0]||r.createdAt===before[0]&&r.id<before[1]);
-    const page=rows.slice(0,limit);return {messages:page.map(({readAt,revision,editSecret,editUnavailableAt,...r})=>({...r,...(editUnavailableAt?{editedAt:r.editedAt||editUnavailableAt}:{}),...(r.editedAt!==undefined?messageActions(r):{})})),cursor:rows.length>limit?encodeCursor(page.at(-1)):null};
+    rows.sort(compare);if(before)rows=rows.filter(r=>r.createdAt<before[0]||r.createdAt===before[0]&&(r.id<before[1]||before.length===4&&r.id===before[1]&&messageId(r)<messageId({chat,id:before[1],fromMe:before[2],participant:before[3]})));
+    const page=rows.slice(0,limit);return {messages:page.map(({readAt,revision,editSecret,editUnavailableAt,protocolKey,participantAlt,...r})=>({...r,...this.receiptCounts(r),...(editUnavailableAt?{editedAt:r.editedAt||editUnavailableAt}:{}),...(r.editedAt!==undefined?messageActions(r):{})})),cursor:rows.length>limit?encodeCursor(page.at(-1)):null};
   }
   chats(args = {}) {
+    const view=args.view??'active';if(!['active','archived'].includes(view))throw Error('Invalid chat view.');
     const before=decodeCursor(args.before),limit=pageLimit(args.limit,10),rows=[],stats=this.store.messageStats();
     for(const {value:chat} of this.store.list('chat',{limit:MAX_MESSAGES})) {
+      if((chat.archived===true)!==(view==='archived'))continue;
       const stat=stats.get(this.store.hash(chat.id)),updatedAt=Math.max(chat.updatedAt,stat?.createdAt||0);
       rows.push({...chat,updatedAt,unread:stat?.unread||0});
     }
     rows.sort((a,b)=>b.updatedAt-a.updatedAt||b.id.localeCompare(a.id));
     const filtered=before?rows.filter(r=>r.updatedAt<before[0]||r.updatedAt===before[0]&&r.id<before[1]):rows,page=filtered.slice(0,limit);
-    return {chats:page.map(chat=>{const last=this.store.list('message',{tag:chat.id,limit:1})[0]?.value,avatar=this.store.get('avatar',chat.id)?.avatar||null;return {...chat,avatar,...(last?{lastMessage:last.kind==='protected'?'CIFER protected message':last.text||last.label||'Message'}:{})};}),cursor:filtered.length>limit?encodeCursor(page.at(-1)):null};
+    return {chats:page.map(chat=>{const last=this.store.list('message',{tag:chat.id,limit:1})[0]?.value,avatar=this.store.get('avatar',chat.id)?.avatar||null;return {...chatView(chat),avatar,...(last?{lastMessage:last.kind==='protected'?'CIFER protected message':last.text||last.label||'Message'}:{})};}),cursor:filtered.length>limit?encodeCursor(page.at(-1)):null};
+  }
+  chat(chat) {
+    const row=this.store.get('chat',chat);if(!row)return null;
+    const stat=this.store.messageStats().get(this.store.hash(chat)),last=this.store.list('message',{tag:chat,limit:1})[0]?.value;
+    return {...chatView(row),unread:stat?.unread||0,updatedAt:Math.max(row.updatedAt,stat?.createdAt||0),avatar:this.store.get('avatar',chat)?.avatar||null,...(last?{lastMessage:last.kind==='protected'?'CIFER protected message':last.text||last.label||'Message'}:{})};
   }
   unread() {
-    const stats=this.store.messageStats(),chats=[];let total=0;
-    for(const {value:chat} of this.store.list('chat',{limit:MAX_MESSAGES})){const stat=stats.get(this.store.hash(chat.id));if(stat?.unread){total+=stat.unread;if(chats.length<100)chats.push({chat:chat.id,count:stat.unread,createdAt:stat.createdAt});}}
-    return {unreadTotal:total,unreadChats:chats};
+    const stats=this.store.messageStats(),chats=[];let total=0,archivedCount=0,archivedUnreadTotal=0;
+    for(const {value:chat} of this.store.list('chat',{limit:MAX_MESSAGES})){
+      const stat=stats.get(this.store.hash(chat.id));
+      if(chat.archived===true){archivedCount++;archivedUnreadTotal+=stat?.unread||0;continue;}
+      if(stat?.unread){total+=stat.unread;if(chats.length<100)chats.push({chat:chat.id,count:stat.unread,createdAt:stat.createdAt});}
+    }
+    return {unreadTotal:total,unreadChats:chats,archivedCount,archivedUnreadTotal};
   }
   read(chat, ids) {
-    if(ids!==undefined&&(!Array.isArray(ids)||ids.length>100||ids.some(x=>typeof x!=='string')))throw Error('Invalid message selection.');
-    this.store.transaction(()=>{for(const {value:row} of this.store.list('message',{tag:chat,limit:MAX_MESSAGES}))if(!row.fromMe&&!row.readAt&&(!ids||ids.includes(row.id)))this.save({...row,readAt:Date.now()},true);});
+    const valid=x=>typeof x==='string'?!isGroup(chat):x&&typeof x==='object'&&typeof x.id==='string'&&typeof x.fromMe==='boolean'&&(!isGroup(chat)||peerPattern.test(x.participant||''));
+    if(ids!==undefined&&(!Array.isArray(ids)||ids.length>100||ids.some(x=>!valid(x))))throw Error('Invalid message selection.');
+    this.store.transaction(()=>{for(const {value:row} of this.store.list('message',{tag:chat,limit:MAX_MESSAGES}))if(!row.fromMe&&!row.readAt&&(!ids||ids.some(x=>typeof x==='string'?x===row.id:messageId({...x,chat})===messageId(row))))this.save({...row,readAt:Date.now()},true);});
     return {ok:true};
+  }
+  rebindParticipant(old, participant) {
+    if(old===participant||!peerPattern.test(old)||!peerPattern.test(participant))return;
+    this.store.transaction(()=>{
+      for(const ns of ['tombstone','message','pending-edit','encrypted-edit','read-receipt'])for(const {id,value} of this.store.list(ns,{limit:30000})){
+        if(!isGroup(value.chat)||value.participant!==old)continue;
+        const next={...value,participant},target=messageId(next),present=this.store.get(ns,target);
+        this.store.remove(ns,id);
+        if(ns==='tombstone'){this.tombstone(next);continue;}
+        if(this.store.get('tombstone',target))continue;
+        if(ns==='message'){
+          const merged=present?{...(Number(value.editedAt)>Number(present.editedAt)?next:present),createdAt:Math.min(value.createdAt,present.createdAt),expiresAt:Math.min(value.expiresAt,present.expiresAt),readAt:present.readAt||value.readAt||null,delivery:strongest(present.delivery,value.delivery),editSecret:present.editSecret||value.editSecret}:next;
+          this.save(merged);if(this.store.get('read-receipt',target))this.delivery(merged,'read');
+        }else{
+          const picked=present&&(present.at||present.readAt)>=(value.at||value.readAt)?present:next;
+          const expiresAt=Math.min(present?.expiresAt||Infinity,value.expiresAt||((value.readAt||Date.now())+WEEK));
+          this.store.set(ns,target,{...picked,expiresAt},{expires:expiresAt,created:picked.at||picked.readAt||Date.now(),tag:value.chat});
+          if(ns==='read-receipt')this.delivery(next,'read');
+          if(ns==='pending-edit'&&this.store.get('message',target))this.edit(next,{normalizedContent:picked.content},picked.at);
+        }
+      }
+      for(const {id,value} of this.store.list('group-receipt',{limit:MAX_MESSAGES})){
+        if(value.participant!==old&&value.recipient!==old)continue;
+        this.store.remove('group-receipt',id);
+        this.groupReceipt({...value,participant:value.participant===old?participant:value.participant},value.recipient===old?participant:value.recipient,value.delivery);
+      }
+      for(const {id,value} of this.store.list('mutation',{limit:MAX_MESSAGES}))if(isGroup(value.chat)&&value.participant===old){
+        const next={...value,participant,request:undefined,state:value.state==='prepared'?'cancelled':value.state==='sending'?'uncertain':value.state};
+        this.store.set('mutation',id,next,{expires:value.expiresAt,created:value.createdAt,tag:messageId({chat:value.chat,id:value.targetId,fromMe:value.fromMe,participant})});
+      }
+      for(const {id,value}of this.store.list('group-pending-mutation',{limit:MAX_MESSAGES}))if(value.participant===old||value.actor===old){
+        const next={...value,participant:value.participant===old?participant:value.participant,actor:value.actor===old?participant:value.actor};this.store.remove('group-pending-mutation',id);
+        this.store.set('group-pending-mutation',messageId(next),next,{created:value.at,expires:value.expiresAt||Math.min(Date.now()+120000,value.at+WEEK),tag:value.chat});
+      }
+      for(const {id,value}of this.store.list('group-role',{limit:MAX_MESSAGES}))if(value.intervals.some(r=>r.admins.includes(old))){
+        const intervals=value.intervals.map(r=>({...r,admins:[...new Set(r.admins.map(id=>id===old?participant:id))].sort()}));
+        this.store.set('group-role',id,{...value,intervals},{created:value.checkedAt,expires:value.checkedAt+WEEK});
+      }
+      for(const {id,value}of this.store.list('group-roster',{limit:20}))if(value.participants.some(p=>p.id===old)){
+        const people=new Map();for(const p of value.participants){const id=p.id===old?participant:p.id,prior=people.get(id);people.set(id,{...p,id,admin:!!(p.admin||prior?.admin)});}
+        this.store.set('group-roster',id,{...value,participants:[...people.values()]},{created:value.checkedAt,expires:value.checkedAt+86400000});
+      }
+    });
   }
   rebind(old, chat) {
     if(old===chat)return;
@@ -211,7 +285,7 @@ export class Inbox {
     });
   }
   trim(reserveBytes = 0) {
-    const operations=this.store.totals('operation').bytes+this.store.totals('retry').bytes+this.store.totals('pending-edit').bytes+this.store.totals('encrypted-edit').bytes+this.store.totals('mutation').bytes;
+    const operations=this.store.totals('operation').bytes+this.store.totals('retry').bytes+this.store.totals('pending-edit').bytes+this.store.totals('encrypted-edit').bytes+this.store.totals('mutation').bytes+this.store.totals('group-receipt').bytes+this.store.totals('group-roster').bytes+this.store.totals('group-role').bytes+this.store.totals('group-pending-mutation').bytes;
     if(operations+reserveBytes>this.maxBytes)throw Error('Local message and outbox storage is full.');
     let {count,bytes}=this.store.totals('message');bytes+=operations+reserveBytes;
     if(count>this.maxMessages||bytes>this.maxBytes)for(const {value:row} of this.store.list('message',{oldest:true,limit:MAX_MESSAGES+100})){
@@ -227,5 +301,5 @@ export class Inbox {
     for(const {value:row} of this.store.list('message',{expired:true,limit:MAX_MESSAGES}))this.tombstone(row);
     this.store.prune();this.trim();this.store.checkpoint();
   }
-  reset() { this.store.transaction(()=>{for(const ns of ['message','read-receipt','tombstone','pending-edit','encrypted-edit','mutation','mutation-identity','retry','change','operation','operation-identity','chat','alias','setting','history','history-seed','contact-binding','avatar'])this.store.clear(ns);this.revision(null,'reset');});if(!this.store.depth)this.store.checkpoint(); }
+  reset() { this.store.transaction(()=>{for(const ns of ['message','read-receipt','tombstone','pending-edit','encrypted-edit','mutation','mutation-identity','retry','change','operation','operation-identity','chat','alias','setting','history','history-seed','contact-binding','avatar','group-roster','group-role','group-receipt','group-pending-mutation'])this.store.clear(ns);this.revision(null,'reset');});if(!this.store.depth)this.store.checkpoint(); }
 }
