@@ -2,6 +2,7 @@ import makeWASocket, { Browsers, DisconnectReason, WAMessageStubType, proto } fr
 import pino from 'pino';
 import { Store } from './store.mjs';
 import { encryptedEdit, decryptEdit, editAuthors } from './encrypted-edits.mjs';
+import { Reactions } from './reactions.mjs';
 import { Mutations } from './mutations.mjs';
 import { Inbox, decodeCursor } from './inbox.mjs';
 import { authStore } from './auth-store.mjs';
@@ -23,11 +24,11 @@ class Engine {
     this.store=new Store(directory,key,{account,connection});this.closed=false;this.stopping=false;this.epoch=0;this.socket=null;this.timer=null;this.attempts=0;
     this.state='disconnected';this.qr=null;this.pairCode=null;this.pairExpiresAt=null;this.identity=this.store.get('system','identity')||null;
     this.queue=Promise.resolve();this.queued=0;this.aliasEditReplay=null;this.inflight=new Set();this.changedScheduled=false;this.metadataScheduled=false;this.pairBusy=false;this.pairWaiters=new Set();this.historyRequests=new Map();
-    this.inbox=new Inbox(this.store,(chat,metadata)=>metadata?this.metadata(chat):this.changed(chat),{},key=>{this.chatSync?.forget(key);this.photos?.forget(key);});
+    this.inbox=new Inbox(this.store,(chat,metadata)=>metadata?this.metadata(chat):this.changed(chat),{},key=>{this.chatSync?.forget(key);this.photos?.forget(key);this.reactions?.forget(key);});
     this.avatars=new Avatars({store:this.store,socket:()=>this.socket,live:()=>!this.closed&&!this.stopping&&!this.closing&&this.state==='connected'&&!!this.socket,changed:chat=>this.metadata(chat),fetcher:avatarFetch});
     for(const {id,value}of this.store.list('operation'))if(value.state==='sending')this.store.set('operation',id,{...value,state:'uncertain'},{expires:value.expiresAt,created:value.createdAt,tag:value.messageId});
     this.photos=new Photos(this,photoFetch);
-    this.mutations=new Mutations(this);
+    this.mutations=new Mutations(this);this.reactions=new Reactions(this);
     this.groups=new Groups(this);this.chatSync=new ChatSync(this);this.appStateReady=false;
     this.inbox.prune();
     this.pruner=setInterval(()=>{if(this.closed)return;try{this.inbox.prune();}catch{this.pause('reconnect-required');}},60000);this.pruner.unref?.();
@@ -76,7 +77,7 @@ class Engine {
     if(!mapped&&this.socket?.signalRepository?.lidMapping) mapped=normalizePeer(await this.socket.signalRepository.lidMapping.getPNForLID(peer).catch(()=>null));
     if(this.closed||this.stopping||epoch!==this.epoch)return null;
     if(mapped&&peerPattern.test(mapped)&&mapped.endsWith('@s.whatsapp.net')){
-      if(this.store.get('alias',peer)!==mapped){this.store.set('alias',peer,mapped);this.inbox.rebind(peer,mapped);this.inbox.rebindParticipant(peer,mapped);this.chatSync?.rebind(peer,mapped);this.chatSync?.rebindParticipant(peer,mapped);
+      if(this.store.get('alias',peer)!==mapped){this.store.set('alias',peer,mapped);this.inbox.rebind(peer,mapped);this.inbox.rebindParticipant(peer,mapped);this.chatSync?.rebind(peer,mapped);this.chatSync?.rebindParticipant(peer,mapped);this.reactions?.rebind(peer,mapped);
         this.queueAliasEdits(mapped,epoch);}return mapped;
     }
     return peer;
@@ -161,12 +162,13 @@ class Engine {
     socket.ev.on('contacts.update',rows=>this.enqueue(epoch,()=>this.contacts(rows,epoch)));
     socket.ev.on('chats.upsert',rows=>this.enqueue(epoch,()=>this.chatSettings(rows,epoch)));
     socket.ev.on('chats.update',rows=>this.enqueue(epoch,()=>this.chatSettings(rows,epoch)));
+    socket.ev.on('messages.reaction',events=>{const snapshot=this.reactions.snapshot(events);this.enqueue(epoch,()=>this.reactions.ingest(snapshot,epoch));});
     socket.ev.on('messages.upsert',event=>{
-      const raw=event.messages.map(m=>({...m,key:this.ownKey(m.key)})),snapshot=this.chatSync.snapshot(raw);
+      const raw=event.messages.map(m=>({...m,key:this.ownKey(m.key)})),snapshot=this.chatSync.snapshot(raw),reactions=this.reactions.messages(raw);
       const sealed=raw.map(m=>encryptedEdit(m)).filter(Boolean);
       const mutations=raw.map(m=>sanitizeMutation(m)).filter(Boolean);
       const values=raw.filter(m=>{const change=sanitizeMutation(m);return !change||!change.removed&&!change.envelope;}).map(m=>sanitizeMessage(m)).filter(Boolean);
-      this.enqueue(epoch,async()=>{await this.chatSync.capture(snapshot);if(!live())return;await this.ingest(values,false,epoch);if(!live())return;await this.applyMutations(mutations,epoch);if(live())await this.applyEncryptedEdits(sealed,epoch);});
+      this.enqueue(epoch,async()=>{await this.chatSync.capture(snapshot);if(!live())return;await this.ingest(values,false,epoch);if(!live())return;await this.applyMutations(mutations,epoch);if(live())await this.applyEncryptedEdits(sealed,epoch);if(live())await this.reactions.ingest(reactions,epoch);});
     });
     socket.ev.on('messages.update',rows=>{
       const clean=rows.map(({key,update})=>({key:keyOf(this.ownKey(key)),removed:update.message===null||update.messageStubType===WAMessageStubType.REVOKE,message:update.message?{normalizedContent:extract(update.message)}:undefined,at:Number(update.messageTimestamp||Date.now()/1000)*1000,status:update.status})).filter(r=>r.key);
@@ -196,7 +198,7 @@ class Engine {
       }
     }));
     socket.ev.on('messaging-history.set',event=>{
-      const raw=(event.messages||[]).map(m=>({...m,key:this.ownKey(m.key)})),snapshot=this.chatSync.snapshot(raw);
+      const raw=(event.messages||[]).map(m=>({...m,key:this.ownKey(m.key)})),snapshot=this.chatSync.snapshot(raw),reactions=this.reactions.messages(raw);
       const sealed=raw.map(m=>encryptedEdit(m)).filter(Boolean);
       const mutations=raw.map(m=>sanitizeMutation(m)).filter(Boolean);
       const messages=raw.filter(m=>{const change=sanitizeMutation(m);return !change||!change.removed&&!change.envelope;}).map(m=>sanitizeMessage(m)).filter(Boolean),contacts=(event.contacts||[]),chats=(event.chats||[]),requestId=event.peerDataRequestSessionId;
@@ -208,6 +210,7 @@ class Engine {
         const request=requestId?this.historyRequests.get(requestId):null;
         if(request){const selected=[];for(const m of messages){if(await this.canonical(m.chat,m.alternate,epoch)===request.chat)selected.push(m);}await this.ingest(selected.slice(-20),true,epoch);if(!live())return;request.state='ready';request.hasMore=selected.length>=20;this.changed(request.chat);}
         else {const peers=new Map(),selected=[];for(const m of messages.sort((a,b)=>b.createdAt-a.createdAt)){const chat=await this.canonical(m.chat,m.alternate,epoch);if(!live())return;if(!chat)continue;if(!peers.has(chat)&&peers.size>=10)continue;const count=peers.get(chat)||0;if(count>=20)continue;peers.set(chat,count+1);selected.push(m);}await this.ingest(selected,true,epoch);}
+        if(live())await this.reactions.ingest(reactions,epoch);
       });
     });
     this.statusChanged();return this.status();
@@ -277,7 +280,7 @@ class Engine {
       const candidates=row.fromMe?this.store.list('operation',{tag:row.id,limit:100}).map(r=>r.value):[];
       let op=null;for(const candidate of candidates)if(await this.canonical(candidate.chat,undefined,epoch)===chat){op=candidate;break;}
       if(!this.current(epoch))return;const target=op?op.chat:chat,clean={...row,...key,chat:target};
-      this.inbox.ingest(clean,{history,operationId:op?.operationId});
+      this.inbox.ingest(clean,{history,operationId:op?.operationId});this.reactions.attach(clean);
       const pending=this.store.get('encrypted-edit',messageId(clean));if(pending)await this.applyEncryptedEdits([pending],epoch);if(!this.current(epoch))return;
       if(isGroup(target))await this.groups.reconcilePending(target);if(!this.current(epoch))return;
       if(op){const expiresAt=Math.min(op.expiresAt,row.expiresAt);this.store.set('operation',op.operationId,{...op,expiresAt},{expires:expiresAt,created:op.createdAt,tag:op.messageId});this.inbox.delivery({...clean,fromMe:true},isGroup(target)?'sent':receipt(row.status)||'sent');}
@@ -396,7 +399,7 @@ class Engine {
       if(args.binding===null)this.store.remove('contact-binding',chat);else this.store.set('contact-binding',chat,validateBinding(args.binding,this.account,chat));return {ok:true};
     }
     exact(args,['chat'],['before','limit']);const chat=await this.canonical(assertChat(args.chat));
-    if(method==='messages')return this.inbox.messages(chat,args);
+    if(method==='messages'){const page=this.inbox.messages(chat,args);return {...page,messages:page.messages.map(row=>({...row,reactions:this.reactions.view(row)}))};}
     return this.inbox.read(chat,args.ids);
   }
   async disconnect(){

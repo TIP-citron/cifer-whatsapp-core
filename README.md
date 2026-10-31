@@ -76,7 +76,7 @@ When `remoteUnlinked` is false, the user can revoke the linked device in WhatsAp
 | `disconnect` | `{}` | `{disconnected:true,remoteUnlinked:boolean}` |
 
 Events are `{type:'status',status}`, `{type:'changed',revision,chat?}` or
-`{type:'metadata',chat?}`. Photo/contact and local read-marker events refresh
+`{type:'metadata',chat?}`. Reaction, photo/contact and local read-marker events refresh
 metadata without invalidating message content or sender-confirmation controls. The host
 adds its own generation. Missing QR/code values are null; missing pairing expiry
 is zero. Chat `lastMessage` is a string and protected content uses a placeholder.
@@ -274,3 +274,30 @@ descriptor. A manual retry can renew an expired WhatsApp CDN locator; the origin
 content hashes and media key must still match. Unavailable photos remain retryable
 and require the phone to retain the original. No CIFER cloud service handles photo
 bytes, and the engine writes no plaintext media files.
+
+## Emoji reactions
+
+Direct chats and existing groups support receiving, adding, changing and removing
+emoji reactions. Message pages expose only `reactions: [{emoji,count,mine}]`;
+reactor identities stay in encrypted native storage. Use the durable
+`prepareMutation` / `mutate` flow with `action: "react"`, `text` containing one
+emoji (or an empty string to remove), the original message reference and its
+`expectedVersion`. Group references require the original sender's participant ID.
+No message body or CIFER grant is published for a reaction.
+
+The engine reads standalone reaction events, buffered upserts and history,
+reconciles PN/LID identities and keeps one latest reaction per person. Removals
+retain ordering tombstones until the original expires, so delayed adds cannot
+restore an old reaction. Reactions do not alter message content versions, unread
+counts or conversation ordering. Members of ordinary announcement groups may
+react even when only admins can send messages; membership is refreshed before I/O.
+
+Reaction records share the encrypted 64-MiB content budget, with at most 2,048 per
+message and 10,000 overall. Unknown-message reactions wait at most two minutes;
+known-message reactions expire with the original, including earlier disappearance.
+Deletion and disconnect erase them. Uncertain sends are never automatically
+replayed; an authenticated own-device echo can reconcile the operation.
+
+`prepare:baileys` also applies a hash-pinned group-buffer identity fix. It preserves
+participants in buffered keys so two group authors using the same message ID
+cannot merge their messages or reactions. The direct-chat key format is unchanged.

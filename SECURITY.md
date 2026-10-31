@@ -94,3 +94,10 @@ may survive body expiry to support older-chat archive operations. It has separat
 hard bounds and is erased on unlink. Archived unread rows are retained but omitted
 from all notification and badge summaries. No archive operation implicitly reads
 a conversation; uncertain archive changes are never automatically replayed.
+
+Reaction authors are derived from authenticated WhatsApp envelope keys, never from
+renderer claims. Original group message identities include their participant.
+Cross-conversation reaction targets are rejected. Only one bounded emoji or an
+empty removal is accepted, and renderer results omit raw author/key objects.
+Reaction metadata has the original content's expiry and participates in content
+quota/erasure. A helper generation change fences incoming and outgoing reactions.

@@ -17,9 +17,9 @@ export class Groups {
       poll=setInterval(()=>{if(!this.live(epoch,socket))reject(Error('WhatsApp connection changed.'));},50);
     })]);}finally{clearTimeout(timeout);clearInterval(poll);}
   }
-  cancelPrepared(chat) {
+  cancelPrepared(chat,allowReactions=false) {
     for(const ns of ['operation','mutation'])for(const {id,value}of this.store.list(ns,{limit:MAX_MESSAGES})){
-      if(value.chat!==chat||!['prepared','sending'].includes(value.state))continue;
+      if(value.chat!==chat||!['prepared','sending'].includes(value.state)||allowReactions&&value.action==='react')continue;
       const next={...value,state:value.state==='prepared'?'cancelled':'uncertain',request:undefined};
       this.store.set(ns,id,next,{expires:value.expiresAt,created:value.createdAt,tag:ns==='operation'?value.messageId:messageId({chat,id:value.targetId,fromMe:value.fromMe,participant:value.participant})});
     }
@@ -83,7 +83,7 @@ export class Groups {
       const current={...prior,...fields},restricted=current.isCommunity||current.isCommunityAnnounce?'unsupported-group':current.member===false||current.readOnly===true?'left':current.member!==true||current.metadataCheckedAt===0?'metadata-unavailable':current.announce&&!current.ownAdmin?'admins-only':undefined;
       fields.canSend=!restricted;fields.sendRestriction=restricted||null;
       this.inbox.contact(chat,fields);
-      if(['left','admins-only','unsupported-group'].includes(restricted))this.cancelPrepared(chat);
+      if(['left','admins-only','unsupported-group'].includes(restricted))this.cancelPrepared(chat,restricted==='admins-only');
       if(raw.ephemeralDuration!==undefined){const seconds=Number(raw.ephemeralDuration);if(Number.isSafeInteger(seconds)&&seconds>=0)this.store.set('setting',chat,{seconds});}
       this.engine.metadata(chat);this.reconcilePending(chat);applied.add(chat);
     }
@@ -180,6 +180,11 @@ export class Groups {
       void this.refresh(chat).catch(()=>{}).finally(()=>{this.refreshActive--;this.pumpRefresh();});
     }
   }
+  async authorizeReaction(chat) {
+    if(!isGroup(chat))return;
+    const row=await this.refresh(chat);
+    if(!row||row.member!==true||row.readOnly||!row.metadataCheckedAt||row.isCommunity||row.isCommunityAnnounce)throw Error('This group is read-only or unavailable.');
+  }
   async authorizeSend(chat) {
     if(!isGroup(chat))return;
     const row=await this.refresh(chat);if(!row?.canSend)throw Error(row?.sendRestriction==='admins-only'?'Only group admins can send messages.':'This group is read-only or unavailable.');
@@ -201,7 +206,7 @@ export class Groups {
     }
     if(last?.session===this.session&&last.epoch===epoch&&last.to===null)this.saveRoles(chat,[...admins]);
     if(Number.isInteger(previous.participantCount)&&['add','remove'].includes(event.action))fields.participantCount=Math.max(0,previous.participantCount+(event.action==='add'?1:-1)*people.length);
-    this.inbox.contact(chat,fields);if(fields.member===false||fields.ownAdmin===false&&previous.announce)this.cancelPrepared(chat);this.engine.metadata(chat);
+    this.inbox.contact(chat,fields);if(fields.member===false||fields.ownAdmin===false&&previous.announce)this.cancelPrepared(chat,fields.member!==false);this.engine.metadata(chat);
     this.reconcilePending(chat);this.scheduleRefresh(chat);
   }
   roleAt(chat,actor,at) {
