@@ -142,11 +142,13 @@ and key opening is a separate trust boundary from ordinary local WhatsApp traffi
 
 ## Supported scope and limits
 
-V1 supports individual chats, ordinary text, protected wire transport, captions,
-contact names, phone/LID aliases, limited history, edits/deletes, disappearing
-expiry and delivery receipts. Media messages produce local placeholders. Groups,
-calls, reactions, status and attachment upload/download
-are not implemented. No full WhatsApp-client parity is claimed.
+The current engine supports individual chats and existing groups, ordinary text,
+direct-chat protected wire transport, contact names, phone/LID aliases, bounded
+history, edits/deletes, disappearing expiry and delivery receipts. Media messages
+produce local placeholders. Archive/unarchive and viewed-message read state
+synchronize with WhatsApp. Group creation/administration, protected group sends,
+calls, reactions, status and attachment upload/download remain outside this scope.
+No full WhatsApp-client parity is claimed.
 Ordinary outgoing text is limited to 2,000 UTF-8 bytes; incoming text/captions and
 protected wire records have their own bounded parsing limits.
 
@@ -177,9 +179,9 @@ is offered conservatively for two days; WhatsApp still determines remote accepta
 `delete-local` removes only this engine's copy, including incoming messages.
 
 Call `prepareMutation` before publishing a replacement protected wire, then `mutate`
-with the identical `{operationId, chat, messageId, fromMe, action, expectedVersion}`
-and, for `edit`, `{text, kind, prepared?}`. Actions are `edit`, `delete-everyone`, or
-`delete-local`. Native ownership and current stored content are authoritative.
+with the identical `{operationId, chat, messageId, fromMe, participant?, action, expectedVersion}`
+and, for `edit`, `{text, kind, prepared?}`. Group references include the original
+participant. Actions are `edit`, `delete-everyone`, or `delete-local`. Native ownership and current stored content are authoritative.
 `mutations({chat})` exposes unfinished actions. Prepared actions require an explicit
 resume; queued actions recovered after a crash become uncertain and are never resent.
 
@@ -203,7 +205,8 @@ message ID and authenticated author's PN/LID identities. Chat and direction come
 from the authenticated transport envelope, never the embedded target. Unsupported
 or unauthenticated ciphertext cannot replace a stored body. See the protocol
 reference in [Baileys PR 2743](https://github.com/WhiskeySockets/Baileys/pull/2743);
-the core keeps its reviewed Baileys release and implements only direct-chat edits.
+the core keeps its reviewed Baileys release and authenticates edit authors in both
+direct and group conversations.
 
 An encrypted edit arriving before its original/secret is stored encrypted for at
 most two minutes and within the shortest known disappearance/retention deadline.
