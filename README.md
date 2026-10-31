@@ -158,3 +158,28 @@ Local encryption protects files at rest. The running Mac/helper and its software
 updates remain trusted; plaintext ordinary WhatsApp messages exist in memory while
 being processed. There is no promise of secure deletion from OS backups or of
 recalling content another device already downloaded.
+
+### Message edits and deletion
+
+The engine consumes edit/revoke protocol envelopes as well as Baileys buffered
+upsert and history events. Replayed originals cannot replace a newer version or
+resurrect a deletion. Edits retain the original creation time and shortest expiry.
+An edit received before its original is held encrypted for at most two minutes,
+using conservative disappearance/retention bounds; expiry then records a content-free
+tombstone instead of allowing an older body to return.
+
+`messages` returns `editedAt`, a content `version`, and `editUntil`/`deleteUntil`.
+Only delivered-to-server own text is editable within 15 minutes. Delete for everyone
+is offered conservatively for two days; WhatsApp still determines remote acceptance.
+`delete-local` removes only this engine's copy, including incoming messages.
+
+Call `prepareMutation` before publishing a replacement protected wire, then `mutate`
+with the identical `{operationId, chat, messageId, fromMe, action, expectedVersion}`
+and, for `edit`, `{text, kind, prepared?}`. Actions are `edit`, `delete-everyone`, or
+`delete-local`. Native ownership and current stored content are authoritative.
+`mutations({chat})` exposes unfinished actions. Prepared actions require an explicit
+resume; queued actions recovered after a crash become uncertain and are never resent.
+
+Protected edits publish a fresh v2 wire for the same verified recipient. Neither
+editing nor deleting a WhatsApp row revokes access to previously granted CIFER
+publication links. The host must communicate that limitation.

@@ -38,7 +38,7 @@ export function extract(body) {
     if (!wrapped) break; body = wrapped.message;
   }
   if (!body) return null;
-  const text = body.conversation ?? body.extendedTextMessage?.text ?? body.imageMessage?.caption ?? body.videoMessage?.caption ?? body.documentMessage?.caption;
+  const text = (Object.hasOwn(body, 'conversation') ? body.conversation : undefined) ?? body.extendedTextMessage?.text ?? body.imageMessage?.caption ?? body.videoMessage?.caption ?? body.documentMessage?.caption;
   const media = body.imageMessage ? 'Photo' : body.videoMessage ? 'Video' : body.audioMessage ? 'Audio' : body.documentMessage ? 'Document' : body.stickerMessage ? 'Sticker' : null;
   const context = body.extendedTextMessage?.contextInfo ?? body.imageMessage?.contextInfo ?? body.videoMessage?.contextInfo ?? body.documentMessage?.contextInfo ?? body.audioMessage?.contextInfo ?? body.stickerMessage?.contextInfo;
   const expiration = Number(context?.expiration || 0);
@@ -51,13 +51,39 @@ export function extract(body) {
   const fits = typeof text === 'string' && Buffer.byteLength(text) <= 16000;
   return { text: fits ? text : media ? `${media} · open in WhatsApp` : 'Long message · open in WhatsApp', ...(media ? { label: `${media} · open in WhatsApp` } : {}), kind: fits ? 'ordinary' : 'unsupported', expiration };
 }
+/** Edits/revokes can arrive as protocol envelopes, folded upserts, or history rows. */
+export function sanitizeMutation(message, now = Date.now()) {
+  const key = keyOf(message.key); if (!key) return null;
+  let body = message.message, edited = false;
+  for (let n = 0; n < 8 && body; n++) {
+    if (body.viewOnceMessage || body.viewOnceMessageV2 || body.viewOnceMessageV2Extension) return null;
+    edited ||= !!body.editedMessage;
+    const wrapped = body.ephemeralMessage || body.editedMessage || body.documentWithCaptionMessage;
+    if (!wrapped) break; body = wrapped.message;
+  }
+  const protocol = body?.protocolMessage;
+  if (protocol && !Object.hasOwn(protocol, 'type')) return null;
+  // WAProto.ProtocolMessage: REVOKE=0, MESSAGE_EDIT=14; WAMessageStubType.REVOKE=1.
+  const removed = message.messageStubType === 1 || protocol?.type === 0;
+  if (!removed && !edited && protocol?.type !== 14) return null;
+  if (protocol) {
+    if (!/^[\w-]{1,128}$/.test(protocol.key?.id || '')) return null;
+    // The authenticated envelope owns peer/direction. Never route by a sender-supplied key.
+    key.id = protocol.key.id;
+  }
+  const at = protocol?.timestampMs ? Number(protocol.timestampMs) : Number(message.messageTimestamp) * 1000;
+  if (!Number.isSafeInteger(at) || at <= now - WEEK || at > now + 60000) return null;
+  return { ...key, removed, at, envelope:!!protocol, ...(!removed ? { content: extract(protocol ? protocol.editedMessage : body) } : {}) };
+}
 export function sanitizeMessage(message, now = Date.now()) {
   const key = keyOf(message.key), createdAt = Number(message.messageTimestamp) * 1000;
   if (!key || !Number.isSafeInteger(createdAt) || createdAt <= now - WEEK || createdAt > now + 60000) return null;
   const body = extract(message.message); if (!body) return null;
-  const expiresAt = Math.min(createdAt + WEEK, body.expiration ? createdAt + body.expiration * 1000 : Infinity, body.protectedCreatedAt ? body.protectedCreatedAt + WEEK : Infinity);
+  const mutation = sanitizeMutation(message, now);
+  const earliestCreatedAt = mutation && !mutation.envelope ? createdAt - EDIT_WINDOW : createdAt;
+  const expiresAt = Math.min(earliestCreatedAt + WEEK, body.expiration ? earliestCreatedAt + body.expiration * 1000 : Infinity, body.protectedCreatedAt ? body.protectedCreatedAt + WEEK : Infinity);
   if (expiresAt <= now) return null;
-  return { ...key, ...body, createdAt, expiresAt, status: message.status, name: typeof message.pushName === 'string' ? message.pushName.slice(0, 120) : undefined };
+  return { ...key, ...body, createdAt, expiresAt, ...(mutation && !mutation.envelope ? {editedAt:mutation.at} : {}), status: message.status, name: typeof message.pushName === 'string' ? message.pushName.slice(0, 120) : undefined };
 }
 export function receipt(status) { return status === 4 || status === 5 ? 'read' : status === 3 ? 'delivered' : status === 2 ? 'sent' : null; }
 export function strongest(a = 'sent', b = 'sent') { const ranks = { queued: 0, uncertain: 0, sent: 1, delivered: 2, read: 3 }; return (ranks[a] ?? 0) >= (ranks[b] ?? 0) ? a : b; }
@@ -80,4 +106,14 @@ export function validatePrepared(value, account, chat, wire) {
   if (value.binding) { validateBinding(value.binding, account, chat); if (c.contact !== value.binding.contactId || canonicalJSON(value.owner)!==canonicalJSON(value.binding.owner)) throw Error('Protected contact changed.'); wrapped(value.recipientGrant); }
   else if (c.contact !== null || value.recipientGrant !== null) throw Error('Invalid protected recipient.');
   return value;
+}
+
+export const EDIT_WINDOW = 15 * 60 * 1000;
+// Conservative two-day eligibility; WhatsApp remains authoritative for acceptance.
+export const DELETE_WINDOW = 48 * 60 * 60 * 1000;
+export const messageVersion = row => digest(canonicalJSON([row.chat,row.id,row.fromMe,row.createdAt,row.expiresAt,row.kind,row.text??null,row.wire??null,row.label??null,row.editedAt??null]));
+export function messageActions(row, now = Date.now()) {
+  const sent = ['sent','delivered','read'].includes(row.delivery), own = row.fromMe && sent && row.expiresAt > now;
+  return { version: messageVersion(row), editUntil: own && !row.label && ['ordinary','protected'].includes(row.kind) ? Math.min(row.createdAt + EDIT_WINDOW,row.expiresAt) : 0,
+    deleteUntil: own ? Math.min(row.createdAt + DELETE_WINDOW,row.expiresAt) : 0 };
 }
