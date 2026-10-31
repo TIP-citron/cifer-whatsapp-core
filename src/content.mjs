@@ -75,6 +75,16 @@ export function sanitizeMutation(message, now = Date.now()) {
   if (!Number.isSafeInteger(at) || at <= now - WEEK || at > now + 60000) return null;
   return { ...key, removed, at, envelope:!!protocol, ...(!removed ? { content: extract(protocol ? protocol.editedMessage : body) } : {}) };
 }
+function originalEditSecret(message) {
+  let body=message.message,secret=message.messageSecret;
+  for(let n=0;n<8&&body;n++){
+    if(body.viewOnceMessage||body.viewOnceMessageV2||body.viewOnceMessageV2Extension)return undefined;
+    if(body.messageContextInfo?.messageSecret?.length)secret=body.messageContextInfo.messageSecret;
+    const wrapped=body.ephemeralMessage||body.editedMessage||body.documentWithCaptionMessage;
+    if(!wrapped)break;body=wrapped.message;
+  }
+  return secret instanceof Uint8Array&&secret.length===32?Buffer.from(secret).toString('hex'):undefined;
+}
 export function sanitizeMessage(message, now = Date.now()) {
   const key = keyOf(message.key), createdAt = Number(message.messageTimestamp) * 1000;
   if (!key || !Number.isSafeInteger(createdAt) || createdAt <= now - WEEK || createdAt > now + 60000) return null;
@@ -83,7 +93,7 @@ export function sanitizeMessage(message, now = Date.now()) {
   const earliestCreatedAt = mutation && !mutation.envelope ? createdAt - EDIT_WINDOW : createdAt;
   const expiresAt = Math.min(earliestCreatedAt + WEEK, body.expiration ? earliestCreatedAt + body.expiration * 1000 : Infinity, body.protectedCreatedAt ? body.protectedCreatedAt + WEEK : Infinity);
   if (expiresAt <= now) return null;
-  return { ...key, ...body, createdAt, expiresAt, ...(mutation && !mutation.envelope ? {editedAt:mutation.at} : {}), status: message.status, name: typeof message.pushName === 'string' ? message.pushName.slice(0, 120) : undefined };
+  return { ...key, ...body, editSecret:originalEditSecret(message), createdAt, expiresAt, ...(mutation && !mutation.envelope ? {editedAt:mutation.at} : {}), status: message.status, name: typeof message.pushName === 'string' ? message.pushName.slice(0, 120) : undefined };
 }
 export function receipt(status) { return status === 4 || status === 5 ? 'read' : status === 3 ? 'delivered' : status === 2 ? 'sent' : null; }
 export function strongest(a = 'sent', b = 'sent') { const ranks = { queued: 0, uncertain: 0, sent: 1, delivered: 2, read: 3 }; return (ranks[a] ?? 0) >= (ranks[b] ?? 0) ? a : b; }

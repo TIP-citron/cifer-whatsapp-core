@@ -1,6 +1,7 @@
 import makeWASocket, { Browsers, DisconnectReason, WAMessageStubType, proto } from 'baileys';
 import pino from 'pino';
 import { Store } from './store.mjs';
+import { encryptedEdit, decryptEdit, editAuthors } from './encrypted-edits.mjs';
 import { Mutations } from './mutations.mjs';
 import { Inbox, decodeCursor } from './inbox.mjs';
 import { authStore } from './auth-store.mjs';
@@ -69,7 +70,7 @@ class Engine {
     const auth=authStore(this.store,live);this.state=auth.state.creds.registered?'reconnecting':'pairing';this.qr=null;this.pairCode=null;this.pairExpiresAt=null;
     const socket=this.factory({auth:auth.state,logger,browser:Browsers.macOS('CIFER Local'),markOnlineOnConnect:false,syncFullHistory:false,enableRecentMessageCache:false,generateHighQualityLinkPreview:false,
       shouldSyncHistoryMessage:h=>![proto.Message.HistorySyncType.FULL,proto.Message.HistorySyncType.RECENT].includes(h.syncType),
-      getMessage:async key=>{if(!live())return undefined;const clean=await this.cleanKey(key);if(!live()||!clean||this.store.get('tombstone',messageId(clean)))return undefined;const row=this.store.get('message',messageId(clean));return row&&row.expiresAt>Date.now()&&row.fromMe?{conversation:row.wire||row.text||''}:undefined;}
+      getMessage:async key=>{if(!live())return undefined;const clean=await this.cleanKey(key);if(!live()||!clean||this.store.get('tombstone',messageId(clean)))return undefined;const row=this.store.get('message',messageId(clean));return row&&row.expiresAt>Date.now()&&row.fromMe&&!row.editUnavailableAt&&['ordinary','protected'].includes(row.kind)?{conversation:row.wire||row.text||''}:undefined;}
     });this.socket=socket;
     socket.ev.on('creds.update',()=>{if(live())auth.save();});
     socket.ev.on('connection.update',update=>{
@@ -92,9 +93,10 @@ class Engine {
     socket.ev.on('chats.upsert',rows=>this.enqueue(epoch,()=>this.chatSettings(rows)));
     socket.ev.on('chats.update',rows=>this.enqueue(epoch,()=>this.chatSettings(rows)));
     socket.ev.on('messages.upsert',event=>{
+      const sealed=event.messages.map(m=>encryptedEdit(m)).filter(Boolean);
       const mutations=event.messages.map(m=>sanitizeMutation(m)).filter(Boolean);
       const values=event.messages.filter(m=>{const change=sanitizeMutation(m);return !change||!change.removed&&!change.envelope;}).map(m=>sanitizeMessage(m)).filter(Boolean);
-      this.enqueue(epoch,async()=>{await this.ingest(values);await this.applyMutations(mutations);});
+      this.enqueue(epoch,async()=>{await this.ingest(values);await this.applyMutations(mutations);await this.applyEncryptedEdits(sealed,epoch);});
     });
     socket.ev.on('messages.update',rows=>{
       const clean=rows.map(({key,update})=>({key:keyOf(key),removed:update.message===null||update.messageStubType===WAMessageStubType.REVOKE,message:update.message?{normalizedContent:extract(update.message)}:undefined,at:Number(update.messageTimestamp||Date.now()/1000)*1000,status:update.status})).filter(r=>r.key);
@@ -106,11 +108,13 @@ class Engine {
     }));
     socket.ev.on('message-receipt.update',rows=>this.enqueue(epoch,async()=>{for(const row of rows){const key=await this.cleanKey(row.key);if(!key?.fromMe)continue;const r=row.receipt,state=Number(r.readTimestamp)>0||Number(r.playedTimestamp)>0?'read':Number(r.receiptTimestamp)>0?'delivered':null;if(state)this.inbox.delivery(key,state);}}));
     socket.ev.on('messaging-history.set',event=>{
+      const sealed=(event.messages||[]).map(m=>encryptedEdit(m)).filter(Boolean);
       const mutations=(event.messages||[]).map(m=>sanitizeMutation(m)).filter(Boolean);
       const messages=(event.messages||[]).filter(m=>{const change=sanitizeMutation(m);return !change||!change.removed&&!change.envelope;}).map(m=>sanitizeMessage(m)).filter(Boolean),contacts=(event.contacts||[]),chats=(event.chats||[]),requestId=event.peerDataRequestSessionId;
       this.enqueue(epoch,async()=>{
         await this.contacts(contacts);await this.chatSettings(chats);
         await this.applyMutations(mutations);
+        await this.applyEncryptedEdits(sealed,epoch);
         const request=requestId?this.historyRequests.get(requestId):null;
         if(request){const selected=[];for(const m of messages){if(await this.canonical(m.chat,m.alternate)===request.chat)selected.push(m);}await this.ingest(selected.slice(-20),true);request.state='ready';request.hasMore=selected.length>=20;this.changed(request.chat);}
         else {const peers=new Map(),selected=[];for(const m of messages.sort((a,b)=>b.createdAt-a.createdAt)){const chat=await this.canonical(m.chat,m.alternate);if(!chat)continue;if(!peers.has(chat)&&peers.size>=10)continue;const count=peers.get(chat)||0;if(count>=20)continue;peers.set(chat,count+1);selected.push(m);}await this.ingest(selected,true);}
@@ -118,10 +122,36 @@ class Engine {
     });
     this.statusChanged();return this.status();
   }
+  async applyEncryptedEdits(values,epoch=this.epoch){
+    for(const seal of values){
+      if(this.closed||this.stopping||epoch!==this.epoch)return;
+      const key=await this.cleanKey({remoteJid:seal.chat,remoteJidAlt:seal.alternate,id:seal.id,fromMe:seal.fromMe});
+      if(this.closed||this.stopping||epoch!==this.epoch)return;
+      if(!key||this.store.get('tombstone',messageId(key)))continue;
+      const id=messageId(key),row=this.store.get('message',id);
+      if(!row?.editSecret&&row?.editedAt>=seal.at)continue;
+      if(!row?.editSecret){
+        const old=this.store.get('encrypted-edit',id);if(old&&old.at>=seal.at){this.store.transaction(()=>{this.inbox.unavailableEdit(key,old.at);this.store.set('encrypted-edit',id,old,{expires:old.expiresAt,created:old.at,tag:key.chat});});continue;}
+        if(!old&&this.store.totals('encrypted-edit').count>=10000)throw Error('Message lifecycle storage is full.');
+        this.inbox.trim(Buffer.byteLength(JSON.stringify(seal))+512);
+        const seconds=this.store.get('setting',key.chat)?.seconds;
+        const expiresAt=Math.min(old?.expiresAt||Date.now()+120000,row?.expiresAt||seal.at-900000+WEEK,seconds?seal.at-900000+seconds*1000:Infinity);
+        if(expiresAt<=Date.now()){this.inbox.tombstone(key);continue;}
+        this.store.transaction(()=>{this.inbox.unavailableEdit(key,seal.at);this.store.set('encrypted-edit',id,{...seal,...key,expiresAt},{expires:expiresAt,created:seal.at,tag:key.chat});});
+        continue;
+      }
+      let authors=key.fromMe?editAuthors([this.socket?.user?.id,this.socket?.user?.lid,this.identity]):editAuthors([...(seal.authors||[]),seal.chat,seal.alternate,key.chat]);
+      const mappings=this.socket?.signalRepository?.lidMapping;
+      for(const author of [...authors]){try{const mapped=author.endsWith('@lid')?await bounded(mappings?.getPNForLID?.(author),1000,null):await bounded(mappings?.getLIDForPN?.(author),1000,null);authors=editAuthors([...authors,mapped]);}catch{}}
+      if(this.closed||this.stopping||epoch!==this.epoch)return;
+      const edit=decryptEdit(seal,row.editSecret,authors);
+      if(edit){this.store.remove('encrypted-edit',id);this.inbox.edit(key,{normalizedContent:edit.content},edit.at);}
+    }
+  }
   async applyMutations(values){for(const row of values){const key=await this.cleanKey({remoteJid:row.chat,remoteJidAlt:row.alternate,id:row.id,fromMe:row.fromMe});if(!key)continue;if(row.removed)this.inbox.tombstone(key);else this.inbox.edit(key,{normalizedContent:row.content},row.at);}}
-  async contacts(rows){for(const row of rows.slice(0,10000)){const chat=await this.canonical(row.id||row.lid,row.phoneNumber);if(!chat)continue;this.inbox.contact(chat,{name:row.name||row.notify||row.verifiedName});if(Object.hasOwn(row,'imgUrl'))this.avatars.invalidate(chat,row.imgUrl==='removed'||row.imgUrl===null);}this.metadata();}
+  async contacts(rows){for(const row of rows.slice(0,10000)){const chat=await this.canonical(row.id||row.lid,row.phoneNumber);if(!chat)continue;this.inbox.contact(chat,{name:row.name||row.notify||row.verifiedName});if(Object.hasOwn(row,'imgUrl'))this.avatars.invalidate(chat,row.imgUrl==='removed'||row.imgUrl===null);await this.applyEncryptedEdits(this.store.list('encrypted-edit',{tag:chat,limit:10000}).map(r=>r.value));}this.metadata();}
   async chatSettings(rows){for(const row of rows.slice(0,10000)){const chat=await this.canonical(row.id,row.pnJid);if(!chat)continue;const updatedAt=Math.min(Date.now(),Number(row.conversationTimestamp||0)*1000);this.inbox.contact(chat,{...(row.name?{name:row.name}:{}),...(Number.isSafeInteger(updatedAt)?{updatedAt}:{})});if(row.ephemeralExpiration!==undefined){const seconds=Number(row.ephemeralExpiration);if(Number.isSafeInteger(seconds)&&seconds>=0)this.store.set('setting',chat,{seconds});}const seed=row.messages?.[0]?.message,key=seed?keyOf(seed.key):null,at=Number(seed?.messageTimestamp)*1000;if(key&&Number.isSafeInteger(at)&&at>Date.now()-WEEK)this.store.set('history-seed',chat,{...key,chat,createdAt:at},{expires:at+WEEK,created:at});}this.changed();}
-  async ingest(values,history=false){for(const row of values){const chat=await this.canonical(row.chat,row.alternate);if(!chat)continue;const candidates=row.fromMe?this.store.list('operation',{tag:row.id,limit:100}).map(r=>r.value):[];let op=null;for(const candidate of candidates)if(await this.canonical(candidate.chat)===chat){op=candidate;break;}const target=op?op.chat:chat;this.inbox.ingest({...row,chat:target},{history,operationId:op?.operationId});if(op){const expiresAt=Math.min(op.expiresAt,row.expiresAt);this.store.set('operation',op.operationId,{...op,expiresAt},{expires:expiresAt,created:op.createdAt,tag:op.messageId});this.inbox.delivery({chat:target,id:row.id,fromMe:true},receipt(row.status)||'sent');}}}
+  async ingest(values,history=false){for(const row of values){const chat=await this.canonical(row.chat,row.alternate);if(!chat)continue;const candidates=row.fromMe?this.store.list('operation',{tag:row.id,limit:100}).map(r=>r.value):[];let op=null;for(const candidate of candidates)if(await this.canonical(candidate.chat)===chat){op=candidate;break;}const target=op?op.chat:chat;this.inbox.ingest({...row,chat:target},{history,operationId:op?.operationId});const pending=this.store.get('encrypted-edit',messageId({...row,chat:target}));if(pending)await this.applyEncryptedEdits([pending]);if(op){const expiresAt=Math.min(op.expiresAt,row.expiresAt);this.store.set('operation',op.operationId,{...op,expiresAt},{expires:expiresAt,created:op.createdAt,tag:op.messageId});this.inbox.delivery({chat:target,id:row.id,fromMe:true},receipt(row.status)||'sent');}}}
   async pairingReady(socket,epoch){
     if(this.state==='pairing'&&this.qr&&this.pairExpiresAt>Date.now())return true;
     return new Promise(resolve=>{

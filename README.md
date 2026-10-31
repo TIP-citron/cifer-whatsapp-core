@@ -12,6 +12,7 @@ Use Node 22.20 or newer with `node:sqlite` available. Install the reviewed lockf
 
 ```sh
 npm ci --ignore-scripts
+npm run prepare:baileys
 npm test
 npm run check
 npm audit --omit=dev
@@ -183,3 +184,30 @@ resume; queued actions recovered after a crash become uncertain and are never re
 Protected edits publish a fresh v2 wire for the same verified recipient. Neither
 editing nor deleting a WhatsApp row revokes access to previously granted CIFER
 publication links. The host must communicate that limitation.
+
+### Native encrypted edits
+
+Current WhatsApp clients also send `secretEncryptedMessage` edits. The engine
+retains the original 32-byte message secret inside that message's encrypted SQLite
+record. It never appears in public method results, events, retry callbacks, or logs.
+It shares the message's retention/size budget and is removed with its message.
+A tightly scoped, hash-checked build-time patch to the pinned Baileys decoder keeps
+outer message context when unwrapping an own linked-device message. Run
+`prepare:baileys` after installing with scripts disabled; CIFER's bundle builder
+also applies and verifies this patch. No runtime patch or download occurs.
+
+Decryption uses the standard HKDF-SHA256/AES-GCM add-on format, binding the original
+message ID and authenticated author's PN/LID identities. Chat and direction come
+from the authenticated transport envelope, never the embedded target. Unsupported
+or unauthenticated ciphertext cannot replace a stored body. See the protocol
+reference in [Baileys PR 2743](https://github.com/WhiskeySockets/Baileys/pull/2743);
+the core keeps its reviewed Baileys release and implements only direct-chat edits.
+
+An encrypted edit arriving before its original/secret is stored encrypted for at
+most two minutes and within the shortest known disappearance/retention deadline.
+If a cached older message lacks its secret, its stale body is replaced with an
+unavailable-edit placeholder while history recovery is pending. Expired pending
+edits create a content-free tombstone. Messages processed by older CIFER builds
+may lack this secret; an upgrade cannot recover a previously discarded edit unless
+WhatsApp supplies the relevant history again. Fresh native-client edits must be
+verified on the signed candidate before release.

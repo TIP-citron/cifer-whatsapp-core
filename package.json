@@ -5,9 +5,26 @@
   "type": "module",
   "license": "MIT",
   "main": "src/index.mjs",
-  "exports": { ".": "./src/index.mjs" },
-  "files": ["src", "README.md", "LICENSE"],
-  "engines": { "node": ">=22.20.0" },
-  "scripts": { "test": "node --test test/*.test.mjs", "check": "node scripts/check.mjs", "audit:production": "npm audit --omit=dev" },
-  "dependencies": { "baileys": "7.0.0-rc14", "pino": "9.6.0" }
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.20.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node scripts/check.mjs",
+    "audit:production": "npm audit --omit=dev",
+    "prepare:baileys": "node src/patch-baileys.mjs",
+    "pretest": "npm run prepare:baileys"
+  },
+  "dependencies": {
+    "baileys": "7.0.0-rc14",
+    "pino": "9.6.0"
+  }
 }
