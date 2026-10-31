@@ -13,13 +13,13 @@ export function avatarURL(value) {
       && (url.hostname.endsWith('.whatsapp.net') || url.hostname.endsWith('.whatsapp.com')) ? url.href : null;
   } catch { return null; }
 }
-const dimensions = (width, height) => Number.isSafeInteger(width) && Number.isSafeInteger(height)
-  && width > 0 && height > 0 && width <= AVATAR_DIMENSION && height <= AVATAR_DIMENSION;
 
 /** Small raster containers only. No SVG, animation, HTML, external resources or oversized canvases. */
-export function avatarDataURL(input, mime) {
+export function avatarDataURL(input, mime) { return rasterDataURL(input,mime,{maxBytes:AVATAR_BYTES,maxDimension:AVATAR_DIMENSION,maxPixels:AVATAR_DIMENSION**2}); }
+export function rasterDataURL(input, mime, {maxBytes,maxDimension,maxPixels}) {
+  const dimensions = (width,height) => Number.isSafeInteger(width)&&Number.isSafeInteger(height)&&width>0&&height>0&&width<=maxDimension&&height<=maxDimension&&width*height<=maxPixels;
   const bytes = Buffer.from(input);
-  if (!MIME.has(mime) || !bytes.length || bytes.length > AVATAR_BYTES) throw Error('Invalid profile image.');
+  if (!MIME.has(mime) || !bytes.length || bytes.length > maxBytes) throw Error('Invalid profile image.');
   let width = 0, height = 0;
   if (mime === 'image/png') {
     if (bytes.length < 45 || !bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) throw Error('Invalid profile image.');

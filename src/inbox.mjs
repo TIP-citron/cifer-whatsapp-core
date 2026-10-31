@@ -51,6 +51,7 @@ export class Inbox {
     const old = this.store.get('message', id), state = isGroup(clean.chat)&&clean.fromMe?'sent':receipt(clean.status) || 'sent';
     const pendingRead=this.store.get('read-receipt',id), knownRead=state==='read'||!!pendingRead;
     if (old) {
+      if(!old.image&&clean.image&&!old.editedAt&&old.label==='Photo · open in WhatsApp'){old.image=clean.image;this.save(old);this.trim();}
       if(!old.editSecret&&clean.editSecret){old.editSecret=clean.editSecret;this.save(old);this.trim();}
       if(clean.editedAt)this.edit(old,{normalizedContent:clean},clean.editedAt);
       const current=this.store.get('message',id);if(!current)return false;
@@ -62,7 +63,7 @@ export class Inbox {
     }
     const row = { ...identity(clean), ...(clean.participantAlt?{participantAlt:clean.participantAlt}:{}), ...(clean.protocolKey?{protocolKey:clean.protocolKey}:{}), ...(isGroup(clean.chat)&&clean.name?{senderName:clean.name}:{}), createdAt: clean.createdAt, expiresAt: clean.expiresAt,
       kind: clean.kind, ...(clean.text !== undefined ? { text:clean.text } : {}), ...(clean.wire ? { wire:clean.wire } : {}), ...(clean.label ? { label:clean.label } : {}),
-      editSecret:clean.editSecret, delivery: knownRead ? 'read' : state, readAt: clean.fromMe || history || knownRead ? now : null, editedAt: clean.editedAt || null, ...(operationId ? { operationId } : {}) };
+      image:clean.image, editSecret:clean.editSecret, delivery: knownRead ? 'read' : state, readAt: clean.fromMe || history || knownRead ? now : null, editedAt: clean.editedAt || null, ...(operationId ? { operationId } : {}) };
     this.store.transaction(() => { this.save(row); if(pendingRead)this.store.remove('read-receipt',id); this.contact(row.chat, { updatedAt: row.createdAt, ...(!isGroup(row.chat)&&!row.fromMe && clean.name ? { name:clean.name } : {}) });
       const pending = this.store.get('pending-edit', id);
       if (pending) { this.edit(row, { normalizedContent: pending.content }, pending.at); this.store.remove('pending-edit', id); }
@@ -76,7 +77,7 @@ export class Inbox {
   tombstone(key, now = Date.now(), mutationId) {
     const id = messageId(key);
     this.store.transaction(() => {
-      this.store.remove('message', id); this.store.remove('read-receipt', id); this.store.remove('retry', id); this.store.remove('pending-edit', id); this.store.remove('encrypted-edit', id);
+      this.store.remove('photo', id); this.store.remove('message', id); this.store.remove('read-receipt', id); this.store.remove('retry', id); this.store.remove('pending-edit', id); this.store.remove('encrypted-edit', id);
       for(const {id:receiptId} of this.store.list('group-receipt',{tag:id,limit:10000}))this.store.remove('group-receipt',receiptId);
       this.store.set('tombstone', id, { ...identity(key), deleted:true }, { expires:now + WEEK, created:now, tag:key.chat });
       for (const {id:opId,value} of this.store.list('operation', {tag:key.id})) {
@@ -106,11 +107,11 @@ export class Inbox {
     const expiresAt = Math.min(old.expiresAt, content.expiration ? old.createdAt + content.expiration * 1000 : Infinity, content.protectedCreatedAt ? content.protectedCreatedAt + WEEK : Infinity);
     if (expiresAt <= now) { this.tombstone(key); return; }
     this.store.transaction(()=>{
-      this.store.remove('retry',id);this.store.remove('pending-edit',id);this.store.remove('encrypted-edit',id);
+      this.store.remove('photo',id);this.store.remove('retry',id);this.store.remove('pending-edit',id);this.store.remove('encrypted-edit',id);
       // The original body/grants must not survive an edit in the recoverable outbox.
       for(const {id:opId,value}of this.store.list('operation',{tag:key.id}))if(key.fromMe&&value.chat===key.chat)this.store.set('operation',opId,{...value,request:undefined,state:value.state==='prepared'?'cancelled':value.state},{expires:Math.min(value.expiresAt,expiresAt),created:value.createdAt,tag:key.id});
       this.resolveMutations(key, content, mutationId);
-      this.save({ ...old, text:content.text, wire:content.wire, label:content.label, kind:content.kind, expiresAt, editedAt, editUnavailableAt:undefined });
+      this.save({ ...old, text:content.text, wire:content.wire, label:content.label, image:content.image||(content.label==='Photo · open in WhatsApp'?old.image:undefined), kind:content.kind, expiresAt, editedAt, editUnavailableAt:undefined });
     });
     this.trim();
   }
@@ -174,7 +175,7 @@ export class Inbox {
       rows.push({id:op.messageId,chat,fromMe:true,...(op.participant?{participant:op.participant}:{}),kind:op.request.kind,...(op.request.kind==='protected'?{wire:op.request.text}:{text:op.request.text}),createdAt:op.createdAt,expiresAt:op.expiresAt,delivery:op.state==='uncertain'?'uncertain':'queued',operationId:op.operationId});
     }
     rows.sort(compare);if(before)rows=rows.filter(r=>r.createdAt<before[0]||r.createdAt===before[0]&&(r.id<before[1]||before.length===4&&r.id===before[1]&&messageId(r)<messageId({chat,id:before[1],fromMe:before[2],participant:before[3]})));
-    const page=rows.slice(0,limit);return {messages:page.map(({readAt,revision,editSecret,editUnavailableAt,protocolKey,participantAlt,...r})=>({...r,...this.receiptCounts(r),...(editUnavailableAt?{editedAt:r.editedAt||editUnavailableAt}:{}),...(r.editedAt!==undefined?messageActions(r):{})})),cursor:rows.length>limit?encodeCursor(page.at(-1)):null};
+    const page=rows.slice(0,limit);return {messages:page.map(({readAt,revision,editSecret,editUnavailableAt,protocolKey,participantAlt,image,...r})=>({...r,...(r.kind!=='protected'&&r.label==='Photo · open in WhatsApp'?{photo:{available:!!image}}:{}),...this.receiptCounts(r),...(editUnavailableAt?{editedAt:r.editedAt||editUnavailableAt}:{}),...(r.editedAt!==undefined?messageActions({...r,image}):{})})),cursor:rows.length>limit?encodeCursor(page.at(-1)):null};
   }
   chats(args = {}) {
     const view=args.view??'active';if(!['active','archived'].includes(view))throw Error('Invalid chat view.');
@@ -214,7 +215,7 @@ export class Inbox {
       for(const ns of ['tombstone','message','pending-edit','encrypted-edit','read-receipt'])for(const {id,value} of this.store.list(ns,{limit:30000})){
         if(!isGroup(value.chat)||value.participant!==old)continue;
         const next={...value,participant},target=messageId(next),present=this.store.get(ns,target);
-        this.store.remove(ns,id);
+        this.store.remove(ns,id);if(ns==='message')this.store.remove('photo',id);
         if(ns==='tombstone'){this.tombstone(next);continue;}
         if(this.store.get('tombstone',target))continue;
         if(ns==='message'){
@@ -259,7 +260,7 @@ export class Inbox {
       for(const {id,value}of this.store.list('encrypted-edit',{tag:old,limit:MAX_MESSAGES})){this.store.remove('encrypted-edit',id);const next={...value,chat},targetId=messageId(next);if(!this.store.get('tombstone',targetId)){const present=this.store.get('encrypted-edit',targetId),moved={...(present&&present.at>=value.at?present:next),expiresAt:Math.min(present?.expiresAt||Infinity,value.expiresAt)};this.store.set('encrypted-edit',targetId,moved,{expires:moved.expiresAt,created:moved.at,tag:chat});}}
       for(const {id,value}of this.store.list('pending-edit',{tag:old,limit:MAX_MESSAGES})){this.store.remove('pending-edit',id);this.edit({...value,chat},{normalizedContent:value.content},value.at);}
       for(const {id,value}of this.store.list('message',{tag:old,limit:MAX_MESSAGES})){
-        const target={...value,chat},targetId=messageId(target);this.store.remove('message',id);this.store.remove('retry',id);
+        const target={...value,chat},targetId=messageId(target);this.store.remove('photo',id);this.store.remove('message',id);this.store.remove('retry',id);
         if(this.store.get('tombstone',targetId))continue;
         const existing=this.store.get('message',targetId);
         const moved=existing?{...(Number(value.editedAt)>Number(existing.editedAt)?target:existing),chat,
@@ -289,7 +290,9 @@ export class Inbox {
   trim(reserveBytes = 0) {
     const operations=this.store.totals('operation').bytes+this.store.totals('retry').bytes+this.store.totals('pending-edit').bytes+this.store.totals('encrypted-edit').bytes+this.store.totals('mutation').bytes+this.store.totals('group-receipt').bytes+this.store.totals('group-roster').bytes+this.store.totals('group-role').bytes+this.store.totals('group-pending-mutation').bytes;
     if(operations+reserveBytes>this.maxBytes)throw Error('Local message and outbox storage is full.');
-    let {count,bytes}=this.store.totals('message');bytes+=operations+reserveBytes;
+    let {count,bytes}=this.store.totals('message');bytes+=operations+reserveBytes+this.store.totals('photo').bytes;
+    // Downloaded photos are replaceable cache; evict them before message bodies.
+    if(bytes>this.maxBytes)for(const {id,value}of this.store.list('photo',{oldest:true,limit:MAX_MESSAGES})){if(bytes<=this.maxBytes)break;bytes-=Buffer.byteLength(JSON.stringify({id,value}));this.store.remove('photo',id);}
     if(count>this.maxMessages||bytes>this.maxBytes)for(const {value:row} of this.store.list('message',{oldest:true,limit:MAX_MESSAGES+100})){
       if(count<=this.maxMessages&&bytes<=this.maxBytes)break;
       const size=Buffer.byteLength(JSON.stringify({id:messageId(row),value:row}));this.tombstone(row);count--;bytes-=size;
@@ -303,5 +306,5 @@ export class Inbox {
     for(const {value:row} of this.store.list('message',{expired:true,limit:MAX_MESSAGES}))this.tombstone(row);
     this.store.prune();this.trim();this.store.checkpoint();
   }
-  reset() { this.store.transaction(()=>{for(const ns of ['message','read-receipt','tombstone','pending-edit','encrypted-edit','mutation','mutation-identity','retry','change','operation','operation-identity','chat','alias','setting','history','history-seed','contact-binding','avatar','group-roster','group-role','group-receipt','group-pending-mutation'])this.store.clear(ns);this.revision(null,'reset');});if(!this.store.depth)this.store.checkpoint(); }
+  reset() { this.store.transaction(()=>{for(const ns of ['photo','message','read-receipt','tombstone','pending-edit','encrypted-edit','mutation','mutation-identity','retry','change','operation','operation-identity','chat','alias','setting','history','history-seed','contact-binding','avatar','group-roster','group-role','group-receipt','group-pending-mutation'])this.store.clear(ns);this.revision(null,'reset');});if(!this.store.depth)this.store.checkpoint(); }
 }

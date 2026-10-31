@@ -144,10 +144,10 @@ and key opening is a separate trust boundary from ordinary local WhatsApp traffi
 
 The current engine supports individual chats and existing groups, ordinary text,
 direct-chat protected wire transport, contact names, phone/LID aliases, bounded
-history, edits/deletes, disappearing expiry and delivery receipts. Media messages
-produce local placeholders. Archive/unarchive and viewed-message read state
+history, edits/deletes, disappearing expiry and delivery receipts. Incoming photos
+load locally in direct chats and groups; other media retain placeholders. Archive/unarchive and viewed-message read state
 synchronize with WhatsApp. Group creation/administration, protected group sends,
-calls, reactions, status and attachment upload/download remain outside this scope.
+calls, reactions, status, attachment uploads and non-photo downloads remain outside this scope.
 No full WhatsApp-client parity is claimed.
 Ordinary outgoing text is limited to 2,000 UTF-8 bytes; incoming text/captions and
 protected wire records have their own bounded parsing limits.
@@ -250,3 +250,27 @@ and never clears a newer arrival.
 
 These source changes require packaged, real-account qualification before a public
 Mac release. Synthetic fixtures alone are not proof of live WhatsApp behavior.
+
+### Incoming photos
+
+`photo` takes `{ chat, messageId, fromMe, participant?, expectedVersion, retry? }`.
+The participant is mandatory for groups. Message summaries expose only
+`photo: { available }`; media locators and keys stay in encrypted local records.
+A ready result contains a validated raster data URI and its message expiry.
+Other states are `offline`, `busy`, `unavailable`, `refresh-required` and `waiting`.
+
+Only visible conversation photos should be requested. Downloads use WhatsApp
+media hosts with redirects disabled and a 12 MiB limit. The engine verifies the
+encrypted hash, MAC and plaintext hash before accepting JPEG, PNG or static WebP
+(up to 32 megapixels and 8192 pixels on either side). At most two downloads run
+at once. Cached bytes share the existing 64 MiB encrypted content budget and are
+evicted before message bodies; they never displace authentication. Expiry, edits,
+deletions, alias changes and account shutdown invalidate cached or pending photos.
+View-once content is never downloaded or retained.
+
+Older versions discarded attachment descriptors. Explicit refresh can ask the
+linked phone to resend such a message, while history replay can also restore its
+descriptor. A manual retry can renew an expired WhatsApp CDN locator; the original
+content hashes and media key must still match. Unavailable photos remain retryable
+and require the phone to retain the original. No CIFER cloud service handles photo
+bytes, and the engine writes no plaintext media files.

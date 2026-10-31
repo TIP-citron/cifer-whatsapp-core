@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { imageDescriptor } from './photo-content.mjs';
 
 export const WEEK = 604800000, MAX_MESSAGES = 10000, MAX_BYTES = 64 * 1024 * 1024;
 export const peerPattern = /^\d{5,24}@(s\.whatsapp\.net|lid)$/;
@@ -46,7 +47,7 @@ export function extract(body) {
     const wrapped = body.ephemeralMessage || body.editedMessage || body.documentWithCaptionMessage;
     if (!wrapped) break; body = wrapped.message;
   }
-  if (!body) return null;
+  if (!body || body.imageMessage?.viewOnce) return null;
   const text = (Object.hasOwn(body, 'conversation') ? body.conversation : undefined) ?? body.extendedTextMessage?.text ?? body.imageMessage?.caption ?? body.videoMessage?.caption ?? body.documentMessage?.caption;
   const media = body.imageMessage ? 'Photo' : body.videoMessage ? 'Video' : body.audioMessage ? 'Audio' : body.documentMessage ? 'Document' : body.stickerMessage ? 'Sticker' : null;
   const context = body.extendedTextMessage?.contextInfo ?? body.imageMessage?.contextInfo ?? body.videoMessage?.contextInfo ?? body.documentMessage?.contextInfo ?? body.audioMessage?.contextInfo ?? body.stickerMessage?.contextInfo;
@@ -58,7 +59,7 @@ export function extract(body) {
   }
   if (typeof text !== 'string' && !media) return null;
   const fits = typeof text === 'string' && Buffer.byteLength(text) <= 16000;
-  return { text: fits ? text : media ? `${media} · open in WhatsApp` : 'Long message · open in WhatsApp', ...(media ? { label: `${media} · open in WhatsApp` } : {}), kind: fits ? 'ordinary' : 'unsupported', expiration };
+  return { text: fits ? text : media ? `${media} · open in WhatsApp` : 'Long message · open in WhatsApp', ...(media ? { label: `${media} · open in WhatsApp` } : {}), ...(body.imageMessage ? {image:imageDescriptor(body.imageMessage)} : {}), kind: fits ? 'ordinary' : 'unsupported', expiration };
 }
 /** Edits/revokes can arrive as protocol envelopes, folded upserts, or history rows. */
 export function sanitizeMutation(message, now = Date.now()) {
@@ -139,7 +140,7 @@ export function validatePrepared(value, account, chat, wire) {
 export const EDIT_WINDOW = 15 * 60 * 1000;
 // Conservative two-day eligibility; WhatsApp remains authoritative for acceptance.
 export const DELETE_WINDOW = 48 * 60 * 60 * 1000;
-export const messageVersion = row => digest(canonicalJSON([row.chat,row.id,row.fromMe,row.createdAt,row.expiresAt,row.kind,row.text??null,row.wire??null,row.label??null,row.editedAt??null,...(isGroup(row.chat)?[row.participant||'']:[])]));
+export const messageVersion = row => digest(canonicalJSON([row.chat,row.id,row.fromMe,row.createdAt,row.expiresAt,row.kind,row.text??null,row.wire??null,row.label??null,row.editedAt??null,...(isGroup(row.chat)?[row.participant||'']:[]),...(row.image?[row.image.fileSha256]:[])]));
 export function messageActions(row, now = Date.now()) {
   const sent = ['sent','delivered','read'].includes(row.delivery), own = row.fromMe && sent && row.expiresAt > now;
   return { version: messageVersion(row), editUntil: own && !row.label && ['ordinary','protected'].includes(row.kind) ? Math.min(row.createdAt + EDIT_WINDOW,row.expiresAt) : 0,

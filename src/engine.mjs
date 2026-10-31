@@ -5,6 +5,7 @@ import { encryptedEdit, decryptEdit, editAuthors } from './encrypted-edits.mjs';
 import { Mutations } from './mutations.mjs';
 import { Inbox, decodeCursor } from './inbox.mjs';
 import { authStore } from './auth-store.mjs';
+import { Photos } from './photos.mjs';
 import { Avatars } from './avatars.mjs';
 import { Groups } from './groups.mjs';
 import { ChatSync } from './chat-sync.mjs';
@@ -13,18 +14,19 @@ import { WEEK, assertPeer, assertChat, isGroup, canonicalJSON, digest, exact, ex
 const logger=pino({level:'silent'});
 async function bounded(promise,ms,fallback){let timer;try{return await Promise.race([promise,new Promise(resolve=>{timer=setTimeout(()=>resolve(fallback),ms);})]);}finally{clearTimeout(timer);}}
 const safeClone=value=>JSON.parse(JSON.stringify(value));
-const METHODS=new Set(['status','pair','chats','messages','history','send','prepareSend','operation','operations','read','markRead','profiles','chat','setArchived','binding','bindContact','prepareMutation','mutate','mutations','disconnect']);
+const METHODS=new Set(['status','pair','chats','messages','photo','history','send','prepareSend','operation','operations','read','markRead','profiles','chat','setArchived','binding','bindContact','prepareMutation','mutate','mutations','disconnect']);
 
 class Engine {
-  constructor({directory,key,account,connection,onEvent=()=>{},socketFactory=makeWASocket,avatarFetch=globalThis.fetch}) {
+  constructor({directory,key,account,connection,onEvent=()=>{},socketFactory=makeWASocket,avatarFetch=globalThis.fetch,photoFetch=globalThis.fetch}) {
     if(typeof directory!=='string'||!directory||typeof account!=='string'||!account||account.length>200||typeof connection!=='string'||!connection||connection.length>200||typeof onEvent!=='function')throw Error('Invalid engine configuration.');
     this.account=account;this.connection=connection;this.emit=onEvent;this.factory=socketFactory;
     this.store=new Store(directory,key,{account,connection});this.closed=false;this.stopping=false;this.epoch=0;this.socket=null;this.timer=null;this.attempts=0;
     this.state='disconnected';this.qr=null;this.pairCode=null;this.pairExpiresAt=null;this.identity=this.store.get('system','identity')||null;
     this.queue=Promise.resolve();this.queued=0;this.aliasEditReplay=null;this.inflight=new Set();this.changedScheduled=false;this.metadataScheduled=false;this.pairBusy=false;this.pairWaiters=new Set();this.historyRequests=new Map();
-    this.inbox=new Inbox(this.store,(chat,metadata)=>metadata?this.metadata(chat):this.changed(chat),{},key=>this.chatSync?.forget(key));
+    this.inbox=new Inbox(this.store,(chat,metadata)=>metadata?this.metadata(chat):this.changed(chat),{},key=>{this.chatSync?.forget(key);this.photos?.forget(key);});
     this.avatars=new Avatars({store:this.store,socket:()=>this.socket,live:()=>!this.closed&&!this.stopping&&!this.closing&&this.state==='connected'&&!!this.socket,changed:chat=>this.metadata(chat),fetcher:avatarFetch});
     for(const {id,value}of this.store.list('operation'))if(value.state==='sending')this.store.set('operation',id,{...value,state:'uncertain'},{expires:value.expiresAt,created:value.createdAt,tag:value.messageId});
+    this.photos=new Photos(this,photoFetch);
     this.mutations=new Mutations(this);
     this.groups=new Groups(this);this.chatSync=new ChatSync(this);this.appStateReady=false;
     this.inbox.prune();
@@ -60,7 +62,7 @@ class Engine {
     throw Error('WhatsApp connection changed.');
   }
   pause(state='disconnected'){
-    this.avatars.pause();this.chatSync.pause();this.appStateReady=false;this.aliasEditReplay=null;
+    this.photos?.pause();this.avatars.pause();this.chatSync.pause();this.appStateReady=false;this.aliasEditReplay=null;
     ++this.epoch;clearTimeout(this.timer);this.timer=null;const socket=this.socket;this.socket=null;this.state=state;this.qr=null;this.pairCode=null;this.pairExpiresAt=null;
     for(const finish of this.pairWaiters)finish(false);
     try{socket?.end(new Error('Local session paused'));}catch{}
@@ -381,6 +383,7 @@ class Engine {
     if(method==='mutations'){exact(args,['chat']);return {mutations:this.mutations.list(assertChat(args.chat))};}
     if(method==='history')return this.history(args);
     if(method==='profiles')return this.profiles(args);
+    if(method==='photo')return this.photos.request(args);
     if(method==='chats'){exact(args,[],['before','limit','view']);return this.inbox.chats(args);}
     if(method==='chat'){exact(args,['chat']);return this.inbox.chat(await this.canonical(assertChat(args.chat)));}
     if(method==='setArchived')return this.chatSync.setArchived(args);
@@ -402,7 +405,7 @@ class Engine {
   }
   async finishDisconnect(){
     this.active();this.store.set('system','auto-connect',false);const socket=this.socket;this.stopping=true;++this.epoch;clearTimeout(this.timer);this.timer=null;this.socket=null;this.state='disconnected';this.qr=null;this.pairCode=null;this.pairExpiresAt=null;let remoteUnlinked=false;
-    this.avatars.pause();for(const finish of this.pairWaiters)finish(false);
+    this.photos.pause();this.avatars.pause();for(const finish of this.pairWaiters)finish(false);
     if(socket){try{remoteUnlinked=await bounded(Promise.resolve(socket.logout()).then(()=>true),3000,false);}catch{}}
     try{socket?.end(new Error('WhatsApp disconnected'));}catch{}
     await this.queue;this.store.transaction(()=>{this.store.clear('wa-auth');this.store.clear('wa-key');this.store.remove('system','identity');this.inbox.reset();this.chatSync.reset();this.groups.clear();});this.store.checkpoint();this.identity=null;this.historyRequests.clear();this.stopping=false;if(!this.closing)this.statusChanged();return {disconnected:true,remoteUnlinked};
