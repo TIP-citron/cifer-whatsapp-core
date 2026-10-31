@@ -21,7 +21,7 @@ class Engine {
     this.account=account;this.connection=connection;this.emit=onEvent;this.factory=socketFactory;
     this.store=new Store(directory,key,{account,connection});this.closed=false;this.stopping=false;this.epoch=0;this.socket=null;this.timer=null;this.attempts=0;
     this.state='disconnected';this.qr=null;this.pairCode=null;this.pairExpiresAt=null;this.identity=this.store.get('system','identity')||null;
-    this.queue=Promise.resolve();this.queued=0;this.inflight=new Set();this.changedScheduled=false;this.metadataScheduled=false;this.pairBusy=false;this.pairWaiters=new Set();this.historyRequests=new Map();
+    this.queue=Promise.resolve();this.queued=0;this.aliasEditReplay=null;this.inflight=new Set();this.changedScheduled=false;this.metadataScheduled=false;this.pairBusy=false;this.pairWaiters=new Set();this.historyRequests=new Map();
     this.inbox=new Inbox(this.store,(chat,metadata)=>metadata?this.metadata(chat):this.changed(chat),{},key=>this.chatSync?.forget(key));
     this.avatars=new Avatars({store:this.store,socket:()=>this.socket,live:()=>!this.closed&&!this.stopping&&!this.closing&&this.state==='connected'&&!!this.socket,changed:chat=>this.metadata(chat),fetcher:avatarFetch});
     for(const {id,value}of this.store.list('operation'))if(value.state==='sending')this.store.set('operation',id,{...value,state:'uncertain'},{expires:value.expiresAt,created:value.createdAt,tag:value.messageId});
@@ -44,10 +44,11 @@ class Engine {
     queueMicrotask(()=>{if(this.metadataScheduled!==epoch)return;this.metadataScheduled=false;if(this.current(epoch))this.event({type:'metadata',...(chat?{chat}:{})});});
   }
   enqueue(epoch,job){
-    if(this.closed||this.stopping||epoch!==this.epoch)return;
-    if(this.queued>=128){this.pause('reconnecting');this.scheduleReconnect();return;}
+    if(this.closed||this.stopping||epoch!==this.epoch)return false;
+    if(this.queued>=128){this.pause('reconnecting');this.scheduleReconnect();return false;}
     this.queued++;
     this.queue=this.queue.then(async()=>{if(!this.closed&&!this.stopping&&epoch===this.epoch)await job();}).catch(()=>{if(this.current(epoch))this.event({type:'status',status:{...this.status(),error:'WhatsApp synchronization needs retry.'}});}).finally(()=>{this.queued--;});
+    return true;
   }
   async flushEvents(epoch=this.epoch){
     const deadline=Date.now()+5000,timeout=Symbol('timeout');
@@ -59,7 +60,7 @@ class Engine {
     throw Error('WhatsApp connection changed.');
   }
   pause(state='disconnected'){
-    this.avatars.pause();this.chatSync.pause();this.appStateReady=false;
+    this.avatars.pause();this.chatSync.pause();this.appStateReady=false;this.aliasEditReplay=null;
     ++this.epoch;clearTimeout(this.timer);this.timer=null;const socket=this.socket;this.socket=null;this.state=state;this.qr=null;this.pairCode=null;this.pairExpiresAt=null;
     for(const finish of this.pairWaiters)finish(false);
     try{socket?.end(new Error('Local session paused'));}catch{}
@@ -74,9 +75,24 @@ class Engine {
     if(this.closed||this.stopping||epoch!==this.epoch)return null;
     if(mapped&&peerPattern.test(mapped)&&mapped.endsWith('@s.whatsapp.net')){
       if(this.store.get('alias',peer)!==mapped){this.store.set('alias',peer,mapped);this.inbox.rebind(peer,mapped);this.inbox.rebindParticipant(peer,mapped);this.chatSync?.rebind(peer,mapped);this.chatSync?.rebindParticipant(peer,mapped);
-        this.enqueue(epoch,()=>this.applyEncryptedEdits(this.store.list('encrypted-edit',{limit:10000}).map(r=>r.value).filter(r=>isGroup(r.chat)&&r.participant===mapped),epoch));}return mapped;
+        this.queueAliasEdits(mapped,epoch);}return mapped;
     }
     return peer;
+  }
+  queueAliasEdits(participant,epoch){
+    if(!this.current(epoch)||!this.store.totals('encrypted-edit').count)return;
+    const pending=this.aliasEditReplay;
+    if(pending?.epoch===epoch){pending.participants.add(participant);return;}
+    // A contacts/history/roster batch can resolve thousands of aliases while it
+    // owns the queue. One replay behind that batch must cover every affected author.
+    const replay={epoch,participants:new Set([participant])};this.aliasEditReplay=replay;
+    this.enqueue(epoch,async()=>{
+      if(this.aliasEditReplay!==replay||!this.current(epoch))return;
+      // Alias discoveries during decryption may schedule one subsequent batch.
+      this.aliasEditReplay=null;
+      const values=this.store.list('encrypted-edit',{limit:10000}).map(r=>r.value).filter(r=>isGroup(r.chat)&&replay.participants.has(r.participant));
+      if(values.length)await this.applyEncryptedEdits(values,epoch);
+    });
   }
   ownKey(raw) {
     return isGroup(raw?.remoteJid)&&raw?.fromMe&&!raw.participant?{...raw,participant:this.socket?.user?.id||this.identity||this.socket?.user?.lid}:raw;
@@ -121,7 +137,9 @@ class Engine {
         const identity=normalizePeer(socket.user?.id||auth.state.creds.me?.id);
         if(!peerPattern.test(identity)||(this.identity&&this.identity!==identity)){this.pause('reconnect-required');this.store.set('system','auto-connect',false);this.statusChanged();return;}
         this.identity=identity;this.store.set('system','identity',identity);auth.save();this.state='connected';this.qr=null;this.pairCode=null;this.pairExpiresAt=null;this.attempts=0;this.statusChanged();
-        syncReady();this.enqueue(epoch,async()=>{await this.groups.discover();if(live())await this.chatSync.resume();});
+        syncReady();
+        // Optional group discovery must not hold the inbound synchronization queue during network I/O.
+        void this.groups.discover().then(()=>{if(live())this.chatSync.resume();}).catch(()=>{if(live())this.metadata();});
       }
       if(update.connection==='close'){
         const code=update.lastDisconnect?.error?.output?.statusCode;
@@ -131,7 +149,11 @@ class Engine {
       }
     });
     socket.ev.on('groups.upsert',rows=>this.enqueue(epoch,()=>this.groups.update(rows)));
-    socket.ev.on('groups.update',rows=>this.enqueue(epoch,()=>this.groups.update(rows)));
+    socket.ev.on('groups.update',rows=>this.enqueue(epoch,async()=>{
+      // groupFetchAllParticipating emits then immediately returns its exact rows.
+      // Yield once so discovery can tag that echo before applying genuine events.
+      await Promise.resolve();if(!live())return;const accepted=this.groups.eventRows(rows,epoch,socket);if(accepted.length)await this.groups.update(accepted);
+    }));
     socket.ev.on('group-participants.update',event=>this.enqueue(epoch,()=>this.groups.participants(event)));
     socket.ev.on('contacts.upsert',rows=>this.enqueue(epoch,()=>this.contacts(rows,epoch)));
     socket.ev.on('contacts.update',rows=>this.enqueue(epoch,()=>this.contacts(rows,epoch)));
