@@ -166,7 +166,7 @@ export class Inbox {
         // Alias discovery cannot silently retarget a prepared protected contact/grant.
         this.store.set('operation',id,{...value,chat,request:undefined,state:value.state==='prepared'?'cancelled':value.state},{expires:value.expiresAt,created:value.createdAt,tag:value.messageId});
       }
-      for(const {id,value}of this.store.list('mutation',{limit:10000}))if(value.chat===old)this.store.set('mutation',id,{...value,chat,request:undefined,state:value.state==='prepared'?'cancelled':value.state},{expires:value.expiresAt,created:value.createdAt,tag:messageId({chat,id:value.targetId,fromMe:value.fromMe})});
+      for(const {id,value}of this.store.list('mutation',{limit:10000}))if(value.chat===old)this.store.set('mutation',id,{...value,chat,request:undefined,state:value.state==='prepared'?'cancelled':value.state==='sending'?'uncertain':value.state},{expires:value.expiresAt,created:value.createdAt,tag:messageId({chat,id:value.targetId,fromMe:value.fromMe})});
       this.store.remove('contact-binding',old);
       const avatar=this.store.get('avatar',old);if(avatar&&!this.store.get('avatar',chat))this.store.set('avatar',chat,avatar,{created:avatar.checkedAt,expires:avatar.expiresAt});this.store.remove('avatar',old);
       const setting=this.store.get('setting',old);if(setting&&!this.store.get('setting',chat))this.store.set('setting',chat,setting);this.store.remove('setting',old);

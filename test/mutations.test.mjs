@@ -131,3 +131,11 @@ test('first history sync renders an already edited message with a conservative r
  socket.ev.emit('messaging-history.set',{contacts:[],chats:[],messages:[fixtureMessage('EDITED-HISTORY','',{messageTimestamp:at/1000,message:{editedMessage:{message:{conversation:'current history text'}}}})]});await drain();
  const row=(await read(f))[0];assert.equal(row.text,'current history text');assert.equal(row.editedAt,at);assert.ok(row.expiresAt<=at-EDIT_WINDOW+604800000);
 });
+
+test('identity reconciliation fences an in-flight alias mutation without recreating alias content',async t=>{
+ const f=await fixture(t),socket=await f.connect(),lid='1234567890@lid';socket.ev.emit('messages.upsert',{messages:[outgoing('ALIAS-RACE','original',{key:{id:'ALIAS-RACE',remoteJid:lid,fromMe:true}})]});await drain();
+ const row=(await f.engine.request('messages',{chat:lid})).messages[0],args=input(row);let finish;socket.sendMessage=()=>new Promise(resolve=>{finish=resolve;});
+ const sending=f.engine.request('mutate',args);await drain();socket.ev.emit('contacts.upsert',[{id:lid,phoneNumber:PEER}]);await drain();finish({});
+ const result=await sending;assert.equal(result.state,'uncertain');assert.equal(result.chat,PEER);assert.equal((await read(f))[0].text,'original');
+ const changes=(await f.engine.request('mutations',{chat:PEER})).mutations;assert.equal(changes[0].state,'uncertain');assert.equal(changes[0].request,undefined);
+});

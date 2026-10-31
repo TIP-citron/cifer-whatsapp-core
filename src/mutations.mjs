@@ -77,6 +77,7 @@ export class Mutations {
         await socket.sendMessage(row.chat,input.action==='edit'?{text:input.text,linkPreview:null,edit:key}:{delete:key},options);
         if(engine.closed||engine.stopping||engine.closing||epoch!==engine.epoch) throw Error('WhatsApp connection changed.');
         const current=this.store.get('mutation',row.operationId);
+        if(current&&current.chat!==row.chat)return this.view(current);
         if(!current||current.state==='cancelled'){row={...row,state:'cancelled',request:undefined};return this.view(row);}
         this.store.transaction(()=>{
           if(input.action==='edit') this.inbox.edit(keyOfInput(input),{normalizedContent:extract({conversation:input.text})},row.createdAt,row.operationId);
