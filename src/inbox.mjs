@@ -1,6 +1,8 @@
 import { WEEK, MAX_BYTES, MAX_MESSAGES, EDIT_WINDOW, messageId, messageActions, digest, extract, receipt, strongest, isGroup, peerPattern } from './content.mjs';
 
-const compare = (a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id) || (isGroup(a.chat)?messageId(b).localeCompare(messageId(a)):0);
+// Opaque IDs must use the same ordinal order as the cursor predicates below.
+const descendingId = (a,b) => a===b?0:a<b?1:-1;
+const compare = (a, b) => b.createdAt - a.createdAt || descendingId(a.id,b.id) || (isGroup(a.chat)?descendingId(messageId(a),messageId(b)):0);
 const chatView = row => { const {sendRestriction,...value}=row; return {...value,kind:isGroup(row.id)?'group':'direct',archived:row.archived===true,canSend:isGroup(row.id)?row.canSend===true:row.canSend!==false,...(typeof sendRestriction==='string'&&sendRestriction?{sendRestriction}:{})}; };
 const identity = key => ({chat:key.chat,id:key.id,fromMe:key.fromMe,...(key.participant?{participant:key.participant}:{})});
 export const encodeCursor = row => Buffer.from(JSON.stringify([row.createdAt ?? row.updatedAt, row.id,...(isGroup(row.chat)?[row.fromMe,row.participant||'']:[])])).toString('base64url');
@@ -182,7 +184,7 @@ export class Inbox {
       const stat=stats.get(this.store.hash(chat.id)),updatedAt=Math.max(chat.updatedAt,stat?.createdAt||0);
       rows.push({...chat,updatedAt,unread:stat?.unread||0});
     }
-    rows.sort((a,b)=>b.updatedAt-a.updatedAt||b.id.localeCompare(a.id));
+    rows.sort((a,b)=>b.updatedAt-a.updatedAt||descendingId(a.id,b.id));
     const filtered=before?rows.filter(r=>r.updatedAt<before[0]||r.updatedAt===before[0]&&r.id<before[1]):rows,page=filtered.slice(0,limit);
     return {chats:page.map(chat=>{const last=this.store.list('message',{tag:chat.id,limit:1})[0]?.value,avatar=this.store.get('avatar',chat.id)?.avatar||null;return {...chatView(chat),avatar,...(last?{lastMessage:last.kind==='protected'?'CIFER protected message':last.text||last.label||'Message'}:{})};}),cursor:filtered.length>limit?encodeCursor(page.at(-1)):null};
   }

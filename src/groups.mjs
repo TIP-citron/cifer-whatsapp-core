@@ -109,16 +109,27 @@ export class Groups {
   async applyQueued(epoch,socket,job) {
     if(!this.live(epoch,socket))throw Error('WhatsApp connection changed.');
     if(typeof this.engine.enqueue!=='function')return job(()=>this.live(epoch,socket));
-    let cancelled=false;
+    let cancelled=false,poll;
     const valid=()=>!cancelled&&this.live(epoch,socket);
     const pending=new Promise((resolve,reject)=>{
+      // Waiting behind inbound work must not consume the local apply budget.
+      // A stale queue callback may be skipped entirely, so cancellation also
+      // has to settle this promise before that callback starts.
+      poll=setInterval(()=>{if(!this.live(epoch,socket))reject(Error('WhatsApp connection changed.'));},50);
       const accepted=this.engine.enqueue(epoch,async()=>{
+        clearInterval(poll);poll=null;
         if(!valid()){reject(Error('WhatsApp connection changed.'));return;}
-        try{await job(valid);resolve();}catch(error){reject(error);}
+        try{
+          const applying=Promise.resolve().then(()=>job(valid));
+          void this.bounded(applying,epoch,socket).then(resolve,reject);
+          // Timeout cancels the caller, but the real job retains queue ownership
+          // until its outstanding work settles, preserving serialization.
+          await applying;
+        }catch(error){reject(error);}
       });
       if(accepted===false)reject(Error('WhatsApp connection changed.'));
     });
-    try{return await this.bounded(pending,epoch,socket);}finally{cancelled=true;}
+    try{return await pending;}finally{cancelled=true;clearInterval(poll);}
   }
   async discover() {
     const epoch=this.engine.epoch,socket=this.engine.socket;
