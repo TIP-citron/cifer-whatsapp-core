@@ -96,7 +96,7 @@ class Engine {
       const sealed=event.messages.map(m=>encryptedEdit(m)).filter(Boolean);
       const mutations=event.messages.map(m=>sanitizeMutation(m)).filter(Boolean);
       const values=event.messages.filter(m=>{const change=sanitizeMutation(m);return !change||!change.removed&&!change.envelope;}).map(m=>sanitizeMessage(m)).filter(Boolean);
-      this.enqueue(epoch,async()=>{await this.ingest(values,event.type==='append');await this.applyMutations(mutations);await this.applyEncryptedEdits(sealed,epoch);});
+      this.enqueue(epoch,async()=>{await this.ingest(values);await this.applyMutations(mutations);await this.applyEncryptedEdits(sealed,epoch);});
     });
     socket.ev.on('messages.update',rows=>{
       const clean=rows.map(({key,update})=>({key:keyOf(key),removed:update.message===null||update.messageStubType===WAMessageStubType.REVOKE,message:update.message?{normalizedContent:extract(update.message)}:undefined,at:Number(update.messageTimestamp||Date.now()/1000)*1000,status:update.status})).filter(r=>r.key);

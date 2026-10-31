@@ -35,12 +35,15 @@ test('read receipt arriving before its message survives restart and opaque ident
   assert.equal(page.messages.length, 1); assert.equal(page.messages[0].delivery, 'read'); assert.equal(await unread(f), 0);
 });
 
-test('already-read upserts and append replays stay read while new notify messages remain unread', async t => {
+test('confirmed read upserts and replays stay read while unread offline append and new notify messages remain unread', async t => {
   const f = await fixture(t), socket = await f.connect();
   incoming(socket, [fixtureMessage('READ', 'already read', { status: proto.WebMessageInfo.Status.READ })]);
-  incoming(socket, [fixtureMessage('APPEND')], 'append'); incoming(socket, [fixtureMessage('NEW')]); await drain();
-  assert.equal(await unread(f), 1);
-  incoming(socket, [fixtureMessage('NEW', 'seen later', { status: proto.WebMessageInfo.Status.READ })]); await drain(); assert.equal(await unread(f), 0);
+  // Baileys uses append for offline delivery too: append alone is not a read receipt.
+  incoming(socket, [fixtureMessage('OFFLINE')], 'append'); incoming(socket, [fixtureMessage('NEW')]); await drain();
+  assert.equal(await unread(f), 2);
+  incoming(socket, [fixtureMessage('NEW', 'seen later', { status: proto.WebMessageInfo.Status.READ })]); await drain(); assert.equal(await unread(f), 1);
+  status(socket, 'OFFLINE', proto.WebMessageInfo.Status.READ); await drain();
+  incoming(socket, [fixtureMessage('OFFLINE'), fixtureMessage('NEW')], 'append'); await drain(); assert.equal(await unread(f), 0);
 });
 
 test('real WhatsApp mark-chat-read clears the selected chat without clearing subsequent arrivals or other chats', async t => {
