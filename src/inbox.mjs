@@ -111,7 +111,7 @@ export class Inbox {
       // The original body/grants must not survive an edit in the recoverable outbox.
       for(const {id:opId,value}of this.store.list('operation',{tag:key.id}))if(key.fromMe&&value.chat===key.chat)this.store.set('operation',opId,{...value,request:undefined,state:value.state==='prepared'?'cancelled':value.state},{expires:Math.min(value.expiresAt,expiresAt),created:value.createdAt,tag:key.id});
       this.resolveMutations(key, content, mutationId);
-      for(const {id:reactionId,value}of this.store.list('reaction',{tag:id,limit:2048}))if(value.expiresAt>expiresAt)this.store.set('reaction',reactionId,{...value,expiresAt},{expires:expiresAt,created:value.at,tag:id});
+      for(const ns of ['reaction','reaction-pending'])for(const {id:reactionId,value}of this.store.list(ns,{tag:id,limit:2048}))if(value.expiresAt>expiresAt)this.store.set(ns,reactionId,{...value,expiresAt},{expires:expiresAt,created:value.at,tag:id});
       this.save({ ...old, text:content.text, wire:content.wire, label:content.label, image:content.image||(content.label==='Photo · open in WhatsApp'?old.image:undefined), kind:content.kind, expiresAt, editedAt, editUnavailableAt:undefined });
     });
     this.trim();
@@ -289,7 +289,7 @@ export class Inbox {
     });
   }
   trim(reserveBytes = 0) {
-    const operations=this.store.totals('operation').bytes+this.store.totals('retry').bytes+this.store.totals('pending-edit').bytes+this.store.totals('encrypted-edit').bytes+this.store.totals('mutation').bytes+this.store.totals('reaction').bytes+this.store.totals('group-receipt').bytes+this.store.totals('group-roster').bytes+this.store.totals('group-role').bytes+this.store.totals('group-pending-mutation').bytes;
+    const operations=this.store.totals('operation').bytes+this.store.totals('retry').bytes+this.store.totals('pending-edit').bytes+this.store.totals('encrypted-edit').bytes+this.store.totals('mutation').bytes+this.store.totals('reaction').bytes+this.store.totals('reaction-pending').bytes+this.store.totals('group-receipt').bytes+this.store.totals('group-roster').bytes+this.store.totals('group-role').bytes+this.store.totals('group-pending-mutation').bytes;
     if(operations+reserveBytes>this.maxBytes)throw Error('Local message and outbox storage is full.');
     let {count,bytes}=this.store.totals('message');bytes+=operations+reserveBytes+this.store.totals('photo').bytes;
     // Downloaded photos are replaceable cache; evict them before message bodies.
@@ -307,5 +307,5 @@ export class Inbox {
     for(const {value:row} of this.store.list('message',{expired:true,limit:MAX_MESSAGES}))this.tombstone(row);
     this.store.prune();this.trim();this.store.checkpoint();
   }
-  reset() { this.store.transaction(()=>{for(const ns of ['reaction','photo','message','read-receipt','tombstone','pending-edit','encrypted-edit','mutation','mutation-identity','retry','change','operation','operation-identity','chat','alias','setting','history','history-seed','contact-binding','avatar','group-roster','group-role','group-receipt','group-pending-mutation'])this.store.clear(ns);this.revision(null,'reset');});if(!this.store.depth)this.store.checkpoint(); }
+  reset() { this.store.transaction(()=>{for(const ns of ['reaction','reaction-pending','photo','message','read-receipt','tombstone','pending-edit','encrypted-edit','mutation','mutation-identity','retry','change','operation','operation-identity','chat','alias','setting','history','history-seed','contact-binding','avatar','group-roster','group-role','group-receipt','group-pending-mutation'])this.store.clear(ns);this.revision(null,'reset');});if(!this.store.depth)this.store.checkpoint(); }
 }

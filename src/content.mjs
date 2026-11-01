@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { imageDescriptor } from './photo-content.mjs';
+import { businessContent } from './business-content.mjs';
 
 export const WEEK = 604800000, MAX_MESSAGES = 10000, MAX_BYTES = 64 * 1024 * 1024;
 export const peerPattern = /^\d{5,24}@(s\.whatsapp\.net|lid)$/;
@@ -42,12 +43,19 @@ export function protectedWire(value) {
   return context;
 }
 export function extract(body) {
+  let wrappedOnce=false;
   for (let n = 0; n < 8 && body; n++) {
-    if (body.viewOnceMessage || body.viewOnceMessageV2 || body.viewOnceMessageV2Extension) return null;
-    const wrapped = body.ephemeralMessage || body.editedMessage || body.documentWithCaptionMessage;
+    const once=body.viewOnceMessage||body.viewOnceMessageV2||body.viewOnceMessageV2Extension;
+    wrappedOnce ||= !!once;
+    const wrapped = once || body.ephemeralMessage || body.editedMessage || body.documentWithCaptionMessage;
     if (!wrapped) break; body = wrapped.message;
   }
-  if (!body || body.imageMessage?.viewOnce) return null;
+  const business=businessContent(body);
+  // Interactive business cards use this transport wrapper too. Only an explicit
+  // business card may pass; ordinary view-once photos/videos remain excluded.
+  if(business===null||wrappedOnce&&(!business||Object.keys(body).some(key=>(key==='conversation'||key.endsWith('Message'))&&!['interactiveMessage','templateMessage','buttonsMessage'].includes(key))))return null;
+  body=business||body;
+  if (!body || body.imageMessage?.viewOnce || body.videoMessage?.viewOnce) return null;
   const text = (Object.hasOwn(body, 'conversation') ? body.conversation : undefined) ?? body.extendedTextMessage?.text ?? body.imageMessage?.caption ?? body.videoMessage?.caption ?? body.documentMessage?.caption;
   const media = body.imageMessage ? 'Photo' : body.videoMessage ? 'Video' : body.audioMessage ? 'Audio' : body.documentMessage ? 'Document' : body.stickerMessage ? 'Sticker' : null;
   const context = body.extendedTextMessage?.contextInfo ?? body.imageMessage?.contextInfo ?? body.videoMessage?.contextInfo ?? body.documentMessage?.contextInfo ?? body.audioMessage?.contextInfo ?? body.stickerMessage?.contextInfo;

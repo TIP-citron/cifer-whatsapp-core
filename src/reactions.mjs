@@ -1,9 +1,12 @@
 import { WEEK, digest, isGroup, keyOf, messageId, normalizePeer, peerPattern } from './content.mjs';
 
+import { encryptedReaction, decryptReaction, reactionAuthors } from './encrypted-reactions.mjs';
+
 const emoji = new RegExp('^(?:\\p{RGI_Emoji}|\\p{Extended_Pictographic}\\uFE0F?)$', 'v');
 export const validReaction = text => typeof text==='string' && Buffer.byteLength(text)<=64 && (text==='' || emoji.test(text));
 const identity = key => ({chat:key.chat,id:key.id,fromMe:key.fromMe,...(isGroup(key.chat)?{participant:key.participant}:{})});
 const recordId = row => JSON.stringify([messageId(row),row.actor]);
+const pendingId = row => JSON.stringify([messageId(row),row.actor,row.networkId]);
 const newer = (a,b) => !b || a.at>b.at || a.at===b.at && a.networkId>b.networkId;
 const rawKey = key => key && {remoteJid:key.remoteJid,remoteJidAlt:key.remoteJidAlt,id:key.id,fromMe:key.fromMe,participant:key.participant,participantAlt:key.participantAlt};
 
@@ -24,19 +27,22 @@ export class Reactions {
   messages(messages) {
     const events=[];
     for(const m of messages) {
-      for(const r of (Array.isArray(m.reactions)?m.reactions:[]).slice(0,2048))events.push({key:m.key,reaction:r});
+      // Aggregated reactions may omit the redundant enclosing conversation JID.
+      // Do not infer group actors or overwrite an explicitly different chat.
+      for(const r of (Array.isArray(m.reactions)?m.reactions:[]).slice(0,2048))events.push({key:m.key,reaction:{...r,key:r?.key?{...r.key,remoteJid:r.key.remoteJid||m.key?.remoteJid}:r?.key}});
       // Upsert includes the authenticated envelope, even when the buffer folds its
       // derived event into an existing row. cleanMessage has normalized the target.
       let body=m.message;
       for(let i=0;i<8&&body?.ephemeralMessage;i++)body=body.ephemeralMessage.message;
       if(body?.reactionMessage)events.push({key:body.reactionMessage.key,reaction:{...body.reactionMessage,key:m.key}});
     }
-    return this.snapshot(events);
+    return [...this.snapshot(events),...messages.map(m=>encryptedReaction(m)).filter(Boolean)];
   }
   async ingest(events,epoch=this.engine.epoch) {
     const e=this.engine;
     for(const value of events) {
       if(!e.current(epoch))return;
+      if(value.encrypted){await this.ingestEncrypted(value,epoch);continue;}
       const key=await e.cleanKey(value.key,epoch),source=keyOf(e.ownKey(value.envelope));
       if(!key||!source||!e.current(epoch))continue;
       const sourceChat=await e.canonical(source.chat,source.alternate,epoch);
@@ -44,6 +50,57 @@ export class Reactions {
       const actor=await e.canonical(source.fromMe?e.identity||e.socket?.user?.id:isGroup(key.chat)?source.participant:sourceChat,source.fromMe?e.socket?.user?.lid:source.participantAlt,epoch);
       if(!e.current(epoch))return;if(!peerPattern.test(actor||''))continue;
       this.apply({...identity(key),actor,text:value.text,at:value.at,networkId:source.id});
+    }
+  }
+  async authors(values,epoch) {
+    const e=this.engine,all=reactionAuthors(values),mapping=e.socket?.signalRepository?.lidMapping;
+    for(const author of [...all]){
+      if(!e.current(epoch))return [];
+      let timer;
+      try{const mapped=await Promise.race([author.endsWith('@lid')?mapping?.getPNForLID?.(author):mapping?.getLIDForPN?.(author),new Promise(resolve=>{timer=setTimeout(()=>resolve(null),1000);timer.unref?.();})]);if(mapped)all.push(mapped);}catch{}finally{clearTimeout(timer);}
+    }
+    return reactionAuthors(all);
+  }
+  async ingestEncrypted(value,epoch) {
+    const e=this.engine,source=keyOf(e.ownKey(value.envelope));if(!source)return;
+    const chat=await e.canonical(source.chat,source.alternate,epoch);
+    if(!e.current(epoch)||!chat)return;
+    const actor=await e.canonical(source.fromMe?e.identity||e.socket?.user?.id:isGroup(chat)?source.participant:chat,source.fromMe?e.socket?.user?.lid:source.participantAlt,epoch);
+    if(!e.current(epoch)||!peerPattern.test(actor||''))return;
+    let participant;
+    if(isGroup(chat)){
+      participant=value.key.fromMe?actor:await e.canonical(value.key.participant,value.key.participantAlt,epoch);
+      if(!e.current(epoch)||!peerPattern.test(participant||''))return;
+    }
+    const key={chat,id:value.key.id,fromMe:isGroup(chat)?participant===this.self():source.fromMe?value.key.fromMe:!value.key.fromMe,...(participant?{participant}:{})};
+    const tag=messageId(key);if(this.store.get('tombstone',tag))return;
+    const target=this.store.get('message',tag),expiresAt=Math.min(Date.now()+120000,target?.expiresAt||Infinity,value.at+WEEK);
+    if(expiresAt<=Date.now())return;
+    const row={...key,actor,networkId:source.id,at:value.at,payload:value.payload,iv:value.iv,actorAliases:reactionAuthors([actor,...(source.fromMe?[e.socket?.user?.id,e.socket?.user?.lid]:isGroup(chat)?[source.participant,source.participantAlt]:[source.chat,source.alternate])]),expiresAt};
+    if(await this.resolveEncrypted(row,epoch))return;
+    if(!e.current(epoch)||expiresAt<=Date.now()||this.store.get('tombstone',tag))return;
+    const id=pendingId(row),old=this.store.get('reaction-pending',id);
+    if(!newer(row,old)||!old&&(this.store.totals('reaction-pending').count>=10000||this.store.list('reaction-pending',{tag,limit:2048}).length>=2048))return;
+    this.inbox.trim(Buffer.byteLength(JSON.stringify(row))+256);
+    if(!this.store.get('tombstone',tag))this.store.set('reaction-pending',id,row,{expires:expiresAt,created:row.at,tag});
+  }
+  async resolveEncrypted(row,epoch) {
+    const e=this.engine,tag=messageId(row),target=this.store.get('message',tag);
+    if(!target?.editSecret||target.expiresAt<=Date.now()||this.store.get('tombstone',tag))return false;
+    const creators=await this.authors(target.fromMe?[e.identity,e.socket?.user?.id,e.socket?.user?.lid]:[isGroup(row.chat)?target.participant:row.chat],epoch);
+    const actors=await this.authors([row.actor,...row.actorAliases],epoch);
+    if(!e.current(epoch)||!this.store.get('message',tag)||this.store.get('tombstone',tag))return false;
+    const reaction=decryptReaction(row,target.editSecret,creators,actors);
+    if(!reaction||!validReaction(reaction.text))return false;
+    this.apply({...row,...reaction});
+    const pending=this.store.get('reaction-pending',pendingId(row));
+    if(pending?.networkId===row.networkId)this.store.remove('reaction-pending',pendingId(row));
+    return true;
+  }
+  async replay(chat,key,epoch=this.engine.epoch) {
+    for(const {value}of this.store.list('reaction-pending',key?{tag:messageId(key),limit:2048}:{limit:10000})){
+      if(!this.engine.current(epoch))return;
+      if(value.chat===chat)await this.resolveEncrypted(value,epoch);
     }
   }
   save(row) { this.store.set('reaction',recordId(row),row,{expires:row.expiresAt,created:row.at,tag:messageId(row)}); }
@@ -85,16 +142,17 @@ export class Reactions {
     }
     return [...groups.values()].sort((a,b)=>b.count-a.count||(a.emoji<b.emoji?-1:1));
   }
-  forget(key) { for(const expired of [false,true])for(const {id}of this.store.list('reaction',{tag:messageId(key),limit:2048,expired}))this.store.remove('reaction',id); }
+  forget(key) { for(const ns of ['reaction','reaction-pending'])for(const expired of [false,true])for(const {id}of this.store.list(ns,{tag:messageId(key),limit:2048,expired}))this.store.remove(ns,id); }
   rebind(old,person) {
     this.store.transaction(()=>{
-      for(const {id,value}of this.store.list('reaction',{limit:10000})) {
+      for(const ns of ['reaction','reaction-pending'])for(const {id,value}of this.store.list(ns,{limit:10000})) {
         if(value.chat!==old&&value.participant!==old&&value.actor!==old)continue;
-        this.store.remove('reaction',id);
+        this.store.remove(ns,id);
         const next={...value,chat:value.chat===old?person:value.chat,actor:value.actor===old?person:value.actor,...(value.participant===old?{participant:person}:{})};
         if(this.store.get('tombstone',messageId(next)))continue;
-        const target=this.store.get('message',messageId(next));if(target)next.expiresAt=target.expiresAt;
-        if(newer(next,this.store.get('reaction',recordId(next))))this.save(next);
+        const target=this.store.get('message',messageId(next));if(target)next.expiresAt=ns==='reaction'?target.expiresAt:Math.min(next.expiresAt,target.expiresAt);
+        const nextId=ns==='reaction'?recordId(next):pendingId(next);
+        if(newer(next,this.store.get(ns,nextId))){if(ns==='reaction')this.save(next);else this.store.set(ns,nextId,next,{expires:next.expiresAt,created:next.at,tag:messageId(next)});}
         this.inbox.revision(next.chat,'metadata',{id:next.id,participant:next.participant},true);
       }
     });

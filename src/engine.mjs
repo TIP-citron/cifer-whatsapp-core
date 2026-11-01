@@ -3,6 +3,7 @@ import pino from 'pino';
 import { Store } from './store.mjs';
 import { encryptedEdit, decryptEdit, editAuthors } from './encrypted-edits.mjs';
 import { Reactions } from './reactions.mjs';
+import { RecoveryTrace } from './recovery-trace.mjs';
 import { Mutations } from './mutations.mjs';
 import { Inbox, decodeCursor } from './inbox.mjs';
 import { authStore } from './auth-store.mjs';
@@ -18,15 +19,16 @@ const safeClone=value=>JSON.parse(JSON.stringify(value));
 const METHODS=new Set(['status','pair','chats','messages','photo','history','send','prepareSend','operation','operations','read','markRead','profiles','chat','setArchived','binding','bindContact','prepareMutation','mutate','mutations','disconnect']);
 
 class Engine {
-  constructor({directory,key,account,connection,onEvent=()=>{},socketFactory=makeWASocket,avatarFetch=globalThis.fetch,photoFetch=globalThis.fetch}) {
+  constructor({directory,key,account,connection,onEvent=()=>{},onDiagnostic,socketFactory=makeWASocket,avatarFetch=globalThis.fetch,photoFetch=globalThis.fetch}) {
     if(typeof directory!=='string'||!directory||typeof account!=='string'||!account||account.length>200||typeof connection!=='string'||!connection||connection.length>200||typeof onEvent!=='function')throw Error('Invalid engine configuration.');
     this.account=account;this.connection=connection;this.emit=onEvent;this.factory=socketFactory;
     this.store=new Store(directory,key,{account,connection});this.closed=false;this.stopping=false;this.epoch=0;this.socket=null;this.timer=null;this.attempts=0;
     this.state='disconnected';this.qr=null;this.pairCode=null;this.pairExpiresAt=null;this.identity=this.store.get('system','identity')||null;
-    this.queue=Promise.resolve();this.queued=0;this.aliasEditReplay=null;this.inflight=new Set();this.changedScheduled=false;this.metadataScheduled=false;this.pairBusy=false;this.pairWaiters=new Set();this.historyRequests=new Map();
+    this.queue=Promise.resolve();this.queued=0;this.aliasEditReplay=null;this.inflight=new Set();this.changedScheduled=false;this.metadataScheduled=false;this.pairBusy=false;this.pairWaiters=new Set();this.historyRequests=new Map();this.historyFlights=new Map();this.historyRecoveryTargets=new Map();
     this.inbox=new Inbox(this.store,(chat,metadata)=>metadata?this.metadata(chat):this.changed(chat),{},key=>{this.chatSync?.forget(key);this.photos?.forget(key);this.reactions?.forget(key);});
     this.avatars=new Avatars({store:this.store,socket:()=>this.socket,live:()=>!this.closed&&!this.stopping&&!this.closing&&this.state==='connected'&&!!this.socket,changed:chat=>this.metadata(chat),fetcher:avatarFetch});
     for(const {id,value}of this.store.list('operation'))if(value.state==='sending')this.store.set('operation',id,{...value,state:'uncertain'},{expires:value.expiresAt,created:value.createdAt,tag:value.messageId});
+    this.recoveryTrace=new RecoveryTrace(onDiagnostic,bytes=>proto.WebMessageInfo.decode(bytes));
     this.photos=new Photos(this,photoFetch);
     this.mutations=new Mutations(this);this.reactions=new Reactions(this);
     this.groups=new Groups(this);this.chatSync=new ChatSync(this);this.appStateReady=false;
@@ -63,7 +65,8 @@ class Engine {
     throw Error('WhatsApp connection changed.');
   }
   pause(state='disconnected'){
-    this.photos?.pause();this.avatars.pause();this.chatSync.pause();this.appStateReady=false;this.aliasEditReplay=null;
+    this.recoveryTrace?.clear();
+    this.photos?.pause();this.avatars.pause();this.chatSync.pause();this.historyRequests.clear();this.historyFlights.clear();this.historyRecoveryTargets.clear();this.appStateReady=false;this.aliasEditReplay=null;
     ++this.epoch;clearTimeout(this.timer);this.timer=null;const socket=this.socket;this.socket=null;this.state=state;this.qr=null;this.pairCode=null;this.pairExpiresAt=null;
     for(const finish of this.pairWaiters)finish(false);
     try{socket?.end(new Error('Local session paused'));}catch{}
@@ -164,11 +167,12 @@ class Engine {
     socket.ev.on('chats.update',rows=>this.enqueue(epoch,()=>this.chatSettings(rows,epoch)));
     socket.ev.on('messages.reaction',events=>{const snapshot=this.reactions.snapshot(events);this.enqueue(epoch,()=>this.reactions.ingest(snapshot,epoch));});
     socket.ev.on('messages.upsert',event=>{
+      if(!live())return;this.recoveryTrace.upserts(event.messages);
       const raw=event.messages.map(m=>({...m,key:this.ownKey(m.key)})),snapshot=this.chatSync.snapshot(raw),reactions=this.reactions.messages(raw);
       const sealed=raw.map(m=>encryptedEdit(m)).filter(Boolean);
       const mutations=raw.map(m=>sanitizeMutation(m)).filter(Boolean);
       const values=raw.filter(m=>{const change=sanitizeMutation(m);return !change||!change.removed&&!change.envelope;}).map(m=>sanitizeMessage(m)).filter(Boolean);
-      this.enqueue(epoch,async()=>{await this.chatSync.capture(snapshot);if(!live())return;await this.ingest(values,false,epoch);if(!live())return;await this.applyMutations(mutations,epoch);if(live())await this.applyEncryptedEdits(sealed,epoch);if(live())await this.reactions.ingest(reactions,epoch);});
+      this.enqueue(epoch,async()=>{await this.chatSync.capture(snapshot);if(!live())return;await this.ingest(values,false,epoch);if(!live())return;await this.applyMutations(mutations,epoch);if(live())await this.applyEncryptedEdits(sealed,epoch);if(live()){await this.reactions.ingest(reactions,epoch);if(live())this.recoveryTrace.applied(this.store,this.reactions);}});
     });
     socket.ev.on('messages.update',rows=>{
       const clean=rows.map(({key,update})=>({key:keyOf(this.ownKey(key)),removed:update.message===null||update.messageStubType===WAMessageStubType.REVOKE,message:update.message?{normalizedContent:extract(update.message)}:undefined,at:Number(update.messageTimestamp||Date.now()/1000)*1000,status:update.status})).filter(r=>r.key);
@@ -198,6 +202,7 @@ class Engine {
       }
     }));
     socket.ev.on('messaging-history.set',event=>{
+      if(!live())return;this.recoveryTrace.history(event.messages||[],event.peerDataRequestSessionId);
       const raw=(event.messages||[]).map(m=>({...m,key:this.ownKey(m.key)})),snapshot=this.chatSync.snapshot(raw),reactions=this.reactions.messages(raw);
       const sealed=raw.map(m=>encryptedEdit(m)).filter(Boolean);
       const mutations=raw.map(m=>sanitizeMutation(m)).filter(Boolean);
@@ -208,9 +213,9 @@ class Engine {
         await this.applyMutations(mutations,epoch);if(!live())return;
         await this.applyEncryptedEdits(sealed,epoch);if(!live())return;
         const request=requestId?this.historyRequests.get(requestId):null;
-        if(request){const selected=[];for(const m of messages){if(await this.canonical(m.chat,m.alternate,epoch)===request.chat)selected.push(m);}await this.ingest(selected.slice(-20),true,epoch);if(!live())return;request.state='ready';request.hasMore=selected.length>=20;this.changed(request.chat);}
+        if(request){const selected=[];for(const m of messages){if(await this.canonical(m.chat,m.alternate,epoch)===request.chat)selected.push(m);}await this.ingest(selected.sort((a,b)=>b.createdAt-a.createdAt).slice(0,request.count||20),true,epoch);if(!live())return;request.state='ready';request.hasMore=selected.length>=(request.count||20);this.changed(request.chat);}
         else {const peers=new Map(),selected=[];for(const m of messages.sort((a,b)=>b.createdAt-a.createdAt)){const chat=await this.canonical(m.chat,m.alternate,epoch);if(!live())return;if(!chat)continue;if(!peers.has(chat)&&peers.size>=10)continue;const count=peers.get(chat)||0;if(count>=20)continue;peers.set(chat,count+1);selected.push(m);}await this.ingest(selected,true,epoch);}
-        if(live())await this.reactions.ingest(reactions,epoch);
+        if(live()){await this.reactions.ingest(reactions,epoch);if(live())this.recoveryTrace.applied(this.store,this.reactions);}
       });
     });
     this.statusChanged();return this.status();
@@ -257,6 +262,7 @@ class Engine {
       this.inbox.contact(chat,{name:row.name||row.notify||row.verifiedName});
       if(Object.hasOwn(row,'imgUrl'))this.avatars.invalidate(chat,row.imgUrl==='removed'||row.imgUrl===null);
       await this.applyEncryptedEdits(this.store.list('encrypted-edit',{tag:chat,limit:10000}).map(r=>r.value),epoch);
+      if(this.current(epoch))await this.reactions.replay(chat,undefined,epoch);
     }this.metadata();
   }
   async chatSettings(rows,epoch=this.epoch){
@@ -280,7 +286,8 @@ class Engine {
       const candidates=row.fromMe?this.store.list('operation',{tag:row.id,limit:100}).map(r=>r.value):[];
       let op=null;for(const candidate of candidates)if(await this.canonical(candidate.chat,undefined,epoch)===chat){op=candidate;break;}
       if(!this.current(epoch))return;const target=op?op.chat:chat,clean={...row,...key,chat:target};
-      this.inbox.ingest(clean,{history,operationId:op?.operationId});this.reactions.attach(clean);
+      const recovered=(this.historyRecoveryTargets.get(messageId(clean))||0)>Date.now();
+      this.inbox.ingest(clean,{history:history||recovered,operationId:op?.operationId});this.reactions.attach(clean);await this.reactions.replay(clean.chat,clean,epoch);
       const pending=this.store.get('encrypted-edit',messageId(clean));if(pending)await this.applyEncryptedEdits([pending],epoch);if(!this.current(epoch))return;
       if(isGroup(target))await this.groups.reconcilePending(target);if(!this.current(epoch))return;
       if(op){const expiresAt=Math.min(op.expiresAt,row.expiresAt);this.store.set('operation',op.operationId,{...op,expiresAt},{expires:expiresAt,created:op.createdAt,tag:op.messageId});this.inbox.delivery({...clean,fromMe:true},isGroup(target)?'sent':receipt(row.status)||'sent');}
@@ -361,17 +368,47 @@ class Engine {
     })();this.inflight.add(job);try{return await job;}finally{this.inflight.delete(job);}
   }
   async history(args){
-    exact(args,['chat'],['before']);const chat=await this.canonical(assertChat(args.chat)),before=decodeCursor(args.before);
-    const old=[...this.historyRequests.values()].find(r=>r.chat===chat&&r.before===args.before&&Date.now()-r.startedAt<30000);
-    if(old){if(old.state==='loading'&&Date.now()-old.startedAt>20000)old.state='unavailable';return {state:old.state,...(old.hasMore!==undefined?{hasMore:old.hasMore}:{})};}
+    exact(args,['chat'],['before','recent']);
+    if(args.recent!==undefined&&typeof args.recent!=='boolean'||args.recent&&args.before!=null)throw Error('Invalid history request.');
+    const epoch=this.epoch,chat=await this.canonical(assertChat(args.chat),undefined,epoch),before=decodeCursor(args.before),recent=args.recent===true;
+    if(!this.current(epoch))throw Error('WhatsApp connection changed.');
     if(this.state!=='connected'||!this.socket)return {state:'unavailable'};
-    const oldest=this.store.list('message',{tag:chat,oldest:true,limit:1})[0]?.value||this.store.get('history-seed',chat);
-    const anchor=before?this.store.list('message',{tag:chat}).map(r=>r.value).find(r=>r.id===before[1]&&r.createdAt===before[0]&&(!isGroup(chat)||before.length===4&&r.fromMe===before[2]&&r.participant===before[3])):oldest;
+    const old=[...this.historyRequests.values()].find(r=>r.chat===chat&&r.before===args.before&&!!r.recent===recent&&Date.now()-r.startedAt<60000);
+    if(old){if(old.state==='loading'&&Date.now()-old.startedAt>20000)old.state='unavailable';return {state:old.state,...(old.hasMore!==undefined?{hasMore:old.hasMore}:{})};}
+    const flightKey=JSON.stringify([chat,args.before||null,recent]),flight=this.historyFlights.get(flightKey);if(flight)return flight;
+    const rows=this.store.list('message',{tag:chat,oldest:!recent,limit:1}),seed=this.store.get('history-seed',chat);
+    const latest=recent?[...rows.map(r=>r.value),...(seed?[seed]:[]),...this.chatSync.rows(chat).map(r=>({...r,createdAt:r.messageTimestamp*1000}))].filter(r=>r.createdAt>Date.now()-WEEK&&!this.store.get('tombstone',messageId(r))).sort((a,b)=>b.createdAt-a.createdAt)[0]:null;
+    // Synchronization ranges also contain reaction/protocol envelopes. A newer
+    // hidden row must not prevent recovery of the latest visible message.
+    const anchor=recent?(rows[0]?.value||latest):before?this.store.list('message',{tag:chat}).map(r=>r.value).find(r=>r.id===before[1]&&r.createdAt===before[0]&&(!isGroup(chat)||before.length===4&&r.fromMe===before[2]&&r.participant===before[3])):rows[0]?.value||seed;
     if(!anchor||anchor.createdAt<=Date.now()-WEEK)return {state:'ready',hasMore:false};
-    const epoch=this.epoch,requestId=await this.socket.fetchMessageHistory(20,this.protocolKey(anchor),anchor.createdAt);
-    if(this.closed||epoch!==this.epoch)throw Error('WhatsApp connection changed.');
-    this.historyRequests.set(requestId,{chat,before:args.before,startedAt:Date.now(),state:'loading'});for(const [id,r]of this.historyRequests)if(Date.now()-r.startedAt>60000)this.historyRequests.delete(id);
-    return {state:'loading'};
+    const socket=this.socket,count=recent?50:20,trace=recent?this.recoveryTrace.begin(anchor,this.store.get('message',messageId(anchor))):null;
+    const job=(async()=>{
+      const requestId=await bounded(socket.fetchMessageHistory(count,this.protocolKey(anchor),Math.floor(anchor.createdAt/1000)),5000,null);
+      if(!this.current(epoch)||this.socket!==socket)throw Error('WhatsApp connection changed.');
+      if(!requestId)return {state:'unavailable'};
+      this.recoveryTrace.set(trace,{historySent:true,historyId:requestId});
+      this.historyRequests.set(requestId,{chat,before:args.before,recent,count,startedAt:Date.now(),state:'loading'});
+      for(const [id,r]of this.historyRequests)if(Date.now()-r.startedAt>60000)this.historyRequests.delete(id);
+      while(this.historyRequests.size>128)this.historyRequests.delete(this.historyRequests.keys().next().value);
+      // History is exclusive of its anchor. Ask the user's phone for that exact
+      // message too, including its current reactions; never synthesize a key/time.
+      if(recent&&typeof socket.requestPlaceholderResend==='function'){
+        for(const [id,until]of this.historyRecoveryTargets)if(until<=Date.now())this.historyRecoveryTargets.delete(id);
+        // Keep one extra metadata target for previously unsupported content, but
+        // never substitute it for the visible message whose reactions are needed.
+        const targets=[anchor];if(latest&&messageId(latest)!==messageId(anchor))targets.push(latest);
+        for(const target of targets){
+          const targetTrace=target===anchor?trace:this.recoveryTrace.begin(target,this.store.get('message',messageId(target)));
+          this.historyRecoveryTargets.set(messageId(target),Date.now()+60000);
+          while(this.historyRecoveryTargets.size>128)this.historyRecoveryTargets.delete(this.historyRecoveryTargets.keys().next().value);
+          void socket.requestPlaceholderResend(this.protocolKey(target),{key:this.protocolKey(target),messageTimestamp:Math.floor(target.createdAt/1000)}).then(id=>{if(this.current(epoch))this.recoveryTrace.set(targetTrace,{resendSent:!!id&&id!=='RESOLVED',resendResolved:id==='RESOLVED',resendId:id});}).catch(()=>{if(this.current(epoch))this.recoveryTrace.set(targetTrace,{resendRejected:true});});
+        }
+      }
+      return {state:'loading'};
+    })();
+    this.historyFlights.set(flightKey,job);
+    try{return await job;}finally{if(this.historyFlights.get(flightKey)===job)this.historyFlights.delete(flightKey);}
   }
   async profiles(args){exact(args,['peers']);if(!Array.isArray(args.peers)||args.peers.length>20)throw Error('Invalid contact selection.');const peers=[];for(const peer of args.peers)peers.push(await this.canonical(assertChat(peer)));return this.avatars.request([...new Set(peers)]);}
   async request(method,args={}){

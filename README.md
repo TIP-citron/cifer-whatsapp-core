@@ -64,7 +64,7 @@ When `remoteUnlinked` is false, the user can revoke the linked device in WhatsAp
 | `chat` | `{chat}` | Single conversation summary, independent of active/archived pagination |
 | `setArchived` | `{chat,archived,operationId}` | `{chat,archived,operationId,state:"sent"|"uncertain"}`; requires connected app-state readiness; uncertain operations are never replayed |
 | `messages` | `{chat,before?,limit?}` | `{messages,cursor}`; default 20, max 100 |
-| `history` | `{chat,before?}` | `{state:'loading'|'ready'|'unavailable',hasMore?}`; phone fetches at most 20 per request |
+| `history` | `{chat,before?,recent?}` | `{state:'loading'|'ready'|'unavailable',hasMore?}`; earlier pages fetch 20; `recent:true` fetches at most 50 using the latest visible message, requests that exact message separately, and may recover one newer metadata-only message. Cannot combine `recent` with `before`. Requests coalesce and reuse results for one minute. |
 | `prepareSend` | `{operationId,chat,text,kind,prepared?}` | Durable prepared operation; does not publish or send |
 | `send` | Same immutable arguments | Operation state and stable WhatsApp message ID |
 | `operation` | `{id}` | Recoverable operation or null |
@@ -301,3 +301,14 @@ replayed; an authenticated own-device echo can reconcile the operation.
 `prepare:baileys` also applies a hash-pinned group-buffer identity fix. It preserves
 participants in buffered keys so two group authors using the same message ID
 cannot merge their messages or reactions. The direct-chat key format is unchanged.
+
+Business template, button and interactive cards display their text/footer and supported
+photo through the same encrypted photo path. Native-flow JSON and action buttons are
+not executed. Interactive transport wrappers are recognized without exposing ordinary
+view-once media or templates marked hidden on linked devices. Recent refresh repairs
+pre-upgrade reactions and skipped cards from the paired phone; expired/deleted
+content remains excluded. Availability depends on the phone supplying that history. Exact-message recovery supplies only the known key and timestamp as fallback metadata. The pinned phone-response decoder retains returned reaction aggregates and secrets, rejects conflicting ownership, and never borrows a timestamp from another message. Compact aggregate reaction keys inherit their enclosing chat; group actor identities remain required.
+
+Encrypted reaction envelopes use the existing per-message secret, the authenticated sender and original author, HKDF `Enc Reaction`, and AES-GCM with empty AAD. Pending envelopes are encrypted, bounded, expire within two minutes, and are erased with their target or account. Protocol references: [whatsmeow message secrets](https://github.com/tulir/whatsmeow/blob/main/msgsecret.go) and [wacore reaction format](https://docs.rs/wacore/latest/wacore/reaction/index.html). Explicit on-demand history uses a request-specific Baileys buffer key so refreshed reactions are not suppressed by initial-sync deduplication.
+
+Recent recovery starts from the latest visible message when available. A newer reaction or protocol record in the archive/read synchronization range does not replace that target. One additional exact-message request may recover newer unsupported content; no message ID or timestamp is invented.
