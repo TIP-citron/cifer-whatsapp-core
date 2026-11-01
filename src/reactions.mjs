@@ -1,3 +1,4 @@
+import { historyDays, DAY } from './storage-policy.mjs';
 import { WEEK, digest, isGroup, keyOf, messageId, normalizePeer, peerPattern } from './content.mjs';
 
 import { encryptedReaction, decryptReaction, reactionAuthors } from './encrypted-reactions.mjs';
@@ -17,7 +18,7 @@ export class Reactions {
     const result=[];
     for(const event of (Array.isArray(events)?events:[]).slice(0,10000)) {
       const r=event?.reaction,at=Number(r?.senderTimestampMs);
-      if(!r || !validReaction(r.text) || !Number.isSafeInteger(at) || at<=Date.now()-WEEK || at>Date.now()+60000)continue;
+      if(!r || !validReaction(r.text) || !Number.isSafeInteger(at) || at<=Date.now()-historyDays(this.store)*DAY || at>Date.now()+60000)continue;
       const key=rawKey(event.key),envelope=rawKey(r.key);
       if(!keyOf(key)||!keyOf(envelope))continue;
       result.push({key,envelope,text:r.text,at});
@@ -29,14 +30,21 @@ export class Reactions {
     for(const m of messages) {
       // Aggregated reactions may omit the redundant enclosing conversation JID.
       // Do not infer group actors or overwrite an explicitly different chat.
-      for(const r of (Array.isArray(m.reactions)?m.reactions:[]).slice(0,2048))events.push({key:m.key,reaction:{...r,key:r?.key?{...r.key,remoteJid:r.key.remoteJid||m.key?.remoteJid}:r?.key}});
+      for(const r of (Array.isArray(m.reactions)?m.reactions:[]).slice(0,2048)) {
+        const key=r?.key?{...r.key,remoteJid:r.key.remoteJid||m.key?.remoteJid}:null;
+        // Compact phone aggregates can omit the false direction field. A group
+        // actor is still explicitly authenticated by its participant identity.
+        // Do not infer a missing participant or a direct-chat author.
+        if(key&&key.fromMe==null&&isGroup(key.remoteJid)&&peerPattern.test(normalizePeer(key.participant)))key.fromMe=false;
+        events.push({key:m.key,reaction:{...r,key}});
+      }
       // Upsert includes the authenticated envelope, even when the buffer folds its
       // derived event into an existing row. cleanMessage has normalized the target.
       let body=m.message;
       for(let i=0;i<8&&body?.ephemeralMessage;i++)body=body.ephemeralMessage.message;
       if(body?.reactionMessage)events.push({key:body.reactionMessage.key,reaction:{...body.reactionMessage,key:m.key}});
     }
-    return [...this.snapshot(events),...messages.map(m=>encryptedReaction(m)).filter(Boolean)];
+    return [...this.snapshot(events),...messages.map(m=>encryptedReaction(m,Date.now(),historyDays(this.store)*DAY)).filter(Boolean)];
   }
   async ingest(events,epoch=this.engine.epoch) {
     const e=this.engine;
@@ -74,7 +82,7 @@ export class Reactions {
     }
     const key={chat,id:value.key.id,fromMe:isGroup(chat)?participant===this.self():source.fromMe?value.key.fromMe:!value.key.fromMe,...(participant?{participant}:{})};
     const tag=messageId(key);if(this.store.get('tombstone',tag))return;
-    const target=this.store.get('message',tag),expiresAt=Math.min(Date.now()+120000,target?.expiresAt||Infinity,value.at+WEEK);
+    const target=this.store.get('message',tag),expiresAt=Math.min(Date.now()+120000,target?.expiresAt||Infinity,value.at+historyDays(this.store)*DAY);
     if(expiresAt<=Date.now())return;
     const row={...key,actor,networkId:source.id,at:value.at,payload:value.payload,iv:value.iv,actorAliases:reactionAuthors([actor,...(source.fromMe?[e.socket?.user?.id,e.socket?.user?.lid]:isGroup(chat)?[source.participant,source.participantAlt]:[source.chat,source.alternate])]),expiresAt};
     if(await this.resolveEncrypted(row,epoch))return;
@@ -90,7 +98,7 @@ export class Reactions {
     const creators=await this.authors(target.fromMe?[e.identity,e.socket?.user?.id,e.socket?.user?.lid]:[isGroup(row.chat)?target.participant:row.chat],epoch);
     const actors=await this.authors([row.actor,...row.actorAliases],epoch);
     if(!e.current(epoch)||!this.store.get('message',tag)||this.store.get('tombstone',tag))return false;
-    const reaction=decryptReaction(row,target.editSecret,creators,actors);
+    const reaction=decryptReaction(row,target.editSecret,creators,actors,Date.now(),historyDays(this.store)*DAY);
     if(!reaction||!validReaction(reaction.text))return false;
     this.apply({...row,...reaction});
     const pending=this.store.get('reaction-pending',pendingId(row));
@@ -107,7 +115,7 @@ export class Reactions {
   apply(value) {
     const tag=messageId(value),target=this.store.get('message',tag),id=recordId(value),old=this.store.get('reaction',id);
     if(this.store.get('tombstone',tag)||!newer(value,old))return;
-    const expiresAt=target?.expiresAt??Math.min(Date.now()+120000,value.at+WEEK);
+    const expiresAt=target?.expiresAt??Math.min(Date.now()+120000,value.at+historyDays(this.store)*DAY);
     if(expiresAt<=Date.now())return;
     if(!old&&(this.store.totals('reaction').count>=10000||this.store.list('reaction',{tag,limit:2048}).length>=2048))return;
     const row={...identity(value),actor:value.actor,text:value.text,at:value.at,networkId:value.networkId,expiresAt};
@@ -116,7 +124,7 @@ export class Reactions {
     if(this.store.get('tombstone',tag))return;
     this.store.transaction(()=>{
       this.save(row);this.reconcile(row);
-      if(target)this.inbox.revision(row.chat,'metadata',{id:row.id,participant:row.participant},true);
+      if(target)this.inbox.revision(row.chat,'metadata',{id:row.id,fromMe:row.fromMe,participant:row.participant},true);
     });
   }
   reconcile(row) {
@@ -142,6 +150,12 @@ export class Reactions {
     }
     return [...groups.values()].sort((a,b)=>b.count-a.count||(a.emoji<b.emoji?-1:1));
   }
+  participants(key) {
+    if(!this.store.get('message',messageId(key)))return [];
+    return this.store.list('reaction',{tag:messageId(key),limit:2048}).map(r=>r.value).filter(r=>!!r.text).map(r=>({
+      id:r.actor,emoji:r.text,mine:r.actor===this.self(),name:r.actor===this.self()?'You':this.store.get('chat',r.actor)?.name||(r.actor.endsWith('@s.whatsapp.net')?'+'+r.actor.split('@')[0]:'WhatsApp participant')
+    }));
+  }
   forget(key) { for(const ns of ['reaction','reaction-pending'])for(const expired of [false,true])for(const {id}of this.store.list(ns,{tag:messageId(key),limit:2048,expired}))this.store.remove(ns,id); }
   rebind(old,person) {
     this.store.transaction(()=>{
@@ -153,7 +167,7 @@ export class Reactions {
         const target=this.store.get('message',messageId(next));if(target)next.expiresAt=ns==='reaction'?target.expiresAt:Math.min(next.expiresAt,target.expiresAt);
         const nextId=ns==='reaction'?recordId(next):pendingId(next);
         if(newer(next,this.store.get(ns,nextId))){if(ns==='reaction')this.save(next);else this.store.set(ns,nextId,next,{expires:next.expiresAt,created:next.at,tag:messageId(next)});}
-        this.inbox.revision(next.chat,'metadata',{id:next.id,participant:next.participant},true);
+        this.inbox.revision(next.chat,'metadata',{id:next.id,fromMe:next.fromMe,participant:next.participant},true);
       }
     });
   }

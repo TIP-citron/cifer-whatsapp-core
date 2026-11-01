@@ -144,10 +144,12 @@ and key opening is a separate trust boundary from ordinary local WhatsApp traffi
 
 The current engine supports individual chats and existing groups, ordinary text,
 direct-chat protected wire transport, contact names, phone/LID aliases, bounded
-history, edits/deletes, disappearing expiry and delivery receipts. Incoming photos
-load locally in direct chats and groups; other media retain placeholders. Archive/unarchive and viewed-message read state
-synchronize with WhatsApp. Group creation/administration, protected group sends,
-calls, reactions, status, attachment uploads and non-photo downloads remain outside this scope.
+history, edits/deletes, disappearing expiry and delivery receipts. Incoming photos,
+audio, videos and static/animated stickers load locally in direct chats and groups.
+Reactions, archive/unarchive and viewed-message read state synchronize with WhatsApp.
+Group creation/administration, protected group sends, calls, status and attachment
+uploads remain outside this snapshot's scope. See the host's parity checklist for
+subsequent compose/share and conversation-tool releases.
 No full WhatsApp-client parity is claimed.
 Ordinary outgoing text is limited to 2,000 UTF-8 bytes; incoming text/captions and
 protected wire records have their own bounded parsing limits.
@@ -312,3 +314,28 @@ content remains excluded. Availability depends on the phone supplying that histo
 Encrypted reaction envelopes use the existing per-message secret, the authenticated sender and original author, HKDF `Enc Reaction`, and AES-GCM with empty AAD. Pending envelopes are encrypted, bounded, expire within two minutes, and are erased with their target or account. Protocol references: [whatsmeow message secrets](https://github.com/tulir/whatsmeow/blob/main/msgsecret.go) and [wacore reaction format](https://docs.rs/wacore/latest/wacore/reaction/index.html). Explicit on-demand history uses a request-specific Baileys buffer key so refreshed reactions are not suppressed by initial-sync deduplication.
 
 Recent recovery starts from the latest visible message when available. A newer reaction or protocol record in the archive/read synchronization range does not replace that target. One additional exact-message request may recover newer unsupported content; no message ID or timestamp is invented.
+
+
+## Stable timeline and received media (release 1 candidate)
+
+Message snapshots include their committed revision. `changes` returns bounded,
+participant-aware additions, edits, metadata, deletions and scoped resets. Native
+events carry immediate invalidation keys; routine history completion and read
+receipts do not invalidate the transcript. Automatic recovery is coalesced and a
+recent successful recovery is remembered.
+
+Audio, video and WebP stickers have private descriptors, authenticated downloads
+and encrypted chunk storage. `mediaOpen` returns an ephemeral native capability;
+only the native host may invoke `mediaRead` for bounded ranges. The native host
+serves those bytes through a local protocol handler, with no network fallback.
+Nothing is readable before complete encrypted-hash, MAC and plaintext-hash
+verification. Media is invalidated by account/lifecycle changes, deletion and
+expiry. View-once media remains excluded.
+
+`storageSettings` selects 7/30/90 days (default 7) and a separate encrypted media
+cache of 256 MiB/1 GiB/5 GiB (default 1 GiB). Message state remains bounded to
+10,000 records / 64 MiB. The media file maximum is 256 MiB; photos retain their
+stricter existing decoder limits. Increasing retention affects future imports
+and does not resurrect previously expired content. Protected deadlines remain
+unchanged. The host must validate all results and never expose private locators
+or cryptographic keys.

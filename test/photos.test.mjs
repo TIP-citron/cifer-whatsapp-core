@@ -57,7 +57,7 @@ test('oversized downloads stop before reading their body, and media renewal pres
  const expired=await insert(f,s,a.image,{id:'RENEW'});let calls=0;s.updateMediaMessage=async message=>{calls++;assert.equal(message.key.id,'RENEW');return {message:{imageMessage:{...a.image,url:'https://mmg.whatsapp.net/v/t62.7118-24/renewed.enc'}}};};
  assert.equal((await f.engine.request('photo',{...request(expired),retry:true})).state,'waiting');assert.equal(calls,1);
 });
-test('photo cache eviction preserves authentication and message records within the combined content quota',async t=>{
- const { Inbox }=await import('../src/inbox.mjs'),f=await fixture(t);const store=new Store(f.directory,f.config.key,{account:f.config.account,connection:f.config.connection});
- try{store.set('wa-auth','fixture',{secret:'auth must survive'});const inbox=new Inbox(store,()=>{},{maxBytes:2048});store.set('photo','cache',{dataUrl:'x'.repeat(3000)},{expires:Date.now()+60000,created:1});inbox.trim();assert.equal(store.totals('photo').count,0);assert.equal(store.get('wa-auth','fixture').secret,'auth must survive');}finally{store.close();}
+test('photo cache uses a separate bounded media quota and preserves authentication',async t=>{
+ const { Inbox }=await import('../src/inbox.mjs'),{ Media }=await import('../src/media.mjs'),f=await fixture(t);const store=new Store(f.directory,f.config.key,{account:f.config.account,connection:f.config.connection});
+ try{store.set('wa-auth','fixture',{secret:'auth must survive'});const inbox=new Inbox(store,()=>{},{maxBytes:2048});store.set('photo','cache',{dataUrl:'x'.repeat(3000)},{expires:Date.now()+60000,created:1});inbox.trim();assert.equal(store.totals('photo').count,1);store.set('system','storage-policy',{historyDays:7,mediaBytes:2048});new Media({store});assert.equal(store.totals('photo').count,0);assert.equal(store.get('wa-auth','fixture').secret,'auth must survive');}finally{store.close();}
 });

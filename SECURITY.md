@@ -101,3 +101,11 @@ Cross-conversation reaction targets are rejected. Only one bounded emoji or an
 empty removal is accepted, and renderer results omit raw author/key objects.
 Reaction metadata has the original content's expiry and participates in content
 quota/erasure. A helper generation change fences incoming and outgoing reactions.
+
+
+Received media uses encrypted, account-bound SQLite chunk records. Interrupted
+downloads are never marked readable and are removed on restart. Native playback
+capabilities expire and are scoped to the helper epoch and exact message version.
+The host must keep range reads private, prohibit backend fallthrough, set no-store
+responses and terminate playback on lock. File lengths, encrypted hashes, MACs,
+plaintext hashes and container headers are verified before a capability is issued.

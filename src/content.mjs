@@ -1,3 +1,4 @@
+import { mediaDescriptor, mediaUnavailable } from './media-content.mjs';
 import { createHash } from 'node:crypto';
 import { imageDescriptor } from './photo-content.mjs';
 import { businessContent } from './business-content.mjs';
@@ -55,10 +56,10 @@ export function extract(body) {
   // business card may pass; ordinary view-once photos/videos remain excluded.
   if(business===null||wrappedOnce&&(!business||Object.keys(body).some(key=>(key==='conversation'||key.endsWith('Message'))&&!['interactiveMessage','templateMessage','buttonsMessage'].includes(key))))return null;
   body=business||body;
-  if (!body || body.imageMessage?.viewOnce || body.videoMessage?.viewOnce) return null;
+  if (!body || body.imageMessage?.viewOnce || body.videoMessage?.viewOnce || body.audioMessage?.viewOnce || body.ptvMessage?.viewOnce) return null;
   const text = (Object.hasOwn(body, 'conversation') ? body.conversation : undefined) ?? body.extendedTextMessage?.text ?? body.imageMessage?.caption ?? body.videoMessage?.caption ?? body.documentMessage?.caption;
-  const media = body.imageMessage ? 'Photo' : body.videoMessage ? 'Video' : body.audioMessage ? 'Audio' : body.documentMessage ? 'Document' : body.stickerMessage ? 'Sticker' : null;
-  const context = body.extendedTextMessage?.contextInfo ?? body.imageMessage?.contextInfo ?? body.videoMessage?.contextInfo ?? body.documentMessage?.contextInfo ?? body.audioMessage?.contextInfo ?? body.stickerMessage?.contextInfo;
+  const media = body.imageMessage ? 'Photo' : body.videoMessage || body.ptvMessage ? 'Video' : body.audioMessage ? 'Audio' : body.documentMessage ? 'Document' : body.stickerMessage ? 'Sticker' : null;
+  const context = body.extendedTextMessage?.contextInfo ?? body.imageMessage?.contextInfo ?? body.videoMessage?.contextInfo ?? body.documentMessage?.contextInfo ?? body.audioMessage?.contextInfo ?? body.ptvMessage?.contextInfo ?? body.stickerMessage?.contextInfo;
   const expiration = Number(context?.expiration || 0);
   if (!Number.isSafeInteger(expiration) || expiration < 0) return null;
   if (typeof text === 'string' && text.startsWith('CIFER:WA:')) {
@@ -67,7 +68,7 @@ export function extract(body) {
   }
   if (typeof text !== 'string' && !media) return null;
   const fits = typeof text === 'string' && Buffer.byteLength(text) <= 16000;
-  return { text: fits ? text : media ? `${media} · open in WhatsApp` : 'Long message · open in WhatsApp', ...(media ? { label: `${media} · open in WhatsApp` } : {}), ...(body.imageMessage ? {image:imageDescriptor(body.imageMessage)} : {}), kind: fits ? 'ordinary' : 'unsupported', expiration };
+  return { text: fits ? text : media ? `${media} · open in WhatsApp` : 'Long message · open in WhatsApp', ...(media ? { label: `${media} · open in WhatsApp` } : {}), ...(body.imageMessage ? {image:imageDescriptor(body.imageMessage)} : {}), media:mediaDescriptor(body), mediaUnavailable:mediaUnavailable(body), kind: fits ? 'ordinary' : 'unsupported', expiration };
 }
 /** Edits/revokes can arrive as protocol envelopes, folded upserts, or history rows. */
 export function sanitizeMutation(message, now = Date.now()) {
@@ -110,15 +111,15 @@ function originalEditSecret(message) {
   }
   return secret instanceof Uint8Array&&secret.length===32?Buffer.from(secret).toString('hex'):undefined;
 }
-export function sanitizeMessage(message, now = Date.now()) {
+export function sanitizeMessage(message, now = Date.now(), retention = WEEK) {
   const key = keyOf(message.key), createdAt = Number(message.messageTimestamp) * 1000;
-  if (!key || !Number.isSafeInteger(createdAt) || createdAt <= now - WEEK || createdAt > now + 60000) return null;
+  if (!key || !Number.isSafeInteger(createdAt) || createdAt <= now - retention || createdAt > now + 60000) return null;
   let body = extract(message.message); if (!body) return null;
   const mutation = sanitizeMutation(message, now);
   // Folded group mutations have lost the authenticated actor; never accept their body as an original.
   if(isGroup(key.chat)&&mutation&&!mutation.envelope)return null;
   const earliestCreatedAt = mutation && !mutation.envelope ? createdAt - EDIT_WINDOW : createdAt;
-  const expiresAt = Math.min(earliestCreatedAt + WEEK, body.expiration ? earliestCreatedAt + body.expiration * 1000 : Infinity, body.protectedCreatedAt ? body.protectedCreatedAt + WEEK : Infinity);
+  const expiresAt = Math.min(earliestCreatedAt + retention, body.expiration ? earliestCreatedAt + body.expiration * 1000 : Infinity, body.protectedCreatedAt ? body.protectedCreatedAt + WEEK : Infinity);
   if (expiresAt <= now) return null;
   return { ...key, ...body, editSecret:originalEditSecret(message), createdAt, expiresAt, ...(mutation && !mutation.envelope ? {editedAt:mutation.at} : {}), status: message.status, name: typeof message.pushName === 'string' ? message.pushName.slice(0, 120) : undefined };
 }
@@ -148,7 +149,7 @@ export function validatePrepared(value, account, chat, wire) {
 export const EDIT_WINDOW = 15 * 60 * 1000;
 // Conservative two-day eligibility; WhatsApp remains authoritative for acceptance.
 export const DELETE_WINDOW = 48 * 60 * 60 * 1000;
-export const messageVersion = row => digest(canonicalJSON([row.chat,row.id,row.fromMe,row.createdAt,row.expiresAt,row.kind,row.text??null,row.wire??null,row.label??null,row.editedAt??null,...(isGroup(row.chat)?[row.participant||'']:[]),...(row.image?[row.image.fileSha256]:[])]));
+export const messageVersion = row => digest(canonicalJSON([row.chat,row.id,row.fromMe,row.createdAt,row.expiresAt,row.kind,row.text??null,row.wire??null,row.label??null,row.editedAt??null,...(isGroup(row.chat)?[row.participant||'']:[]),...(row.image?[row.image.fileSha256]:[]),...(row.media?[row.media.fileSha256]:[])]));
 export function messageActions(row, now = Date.now()) {
   const sent = ['sent','delivered','read'].includes(row.delivery), own = row.fromMe && sent && row.expiresAt > now;
   return { version: messageVersion(row), editUntil: own && !row.label && ['ordinary','protected'].includes(row.kind) ? Math.min(row.createdAt + EDIT_WINDOW,row.expiresAt) : 0,

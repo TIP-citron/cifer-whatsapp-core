@@ -58,7 +58,7 @@ export class Photos {
           const image={url:descriptor.url,mimetype:descriptor.mime,fileLength:descriptor.length,...Object.fromEntries(['mediaKey','fileSha256','fileEncSha256'].map(k=>[k,Buffer.from(descriptor[k],'hex')]))};
           const renewed=await Promise.race([job.socket.updateMediaMessage({key:this.engine.protocolKey(row),message:{imageMessage:image}}),new Promise(resolve=>{retryTimer=setTimeout(()=>resolve(null),5000);})]);
           const next=imageDescriptor(renewed?.message?.imageMessage),current=this.row(job);
-          if(current&&next&&['mime','length','mediaKey','fileSha256','fileEncSha256'].every(k=>next[k]===descriptor[k])){this.engine.inbox.save({...current,image:next});return {state:'waiting'};}
+          if(current&&next&&['mime','length','mediaKey','fileSha256','fileEncSha256'].every(k=>next[k]===descriptor[k])){this.engine.inbox.save({...current,image:next},true);return {state:'waiting'};}
         }finally{clearTimeout(retryTimer);}
         return unavailable();
       }
@@ -79,6 +79,7 @@ export class Photos {
       const dataUrl=rasterDataURL(plain,descriptor.mime,{maxBytes:PHOTO_BYTES,maxDimension:8192,maxPixels:PHOTO_PIXELS});
       row=this.row(job);if(!row)return unavailable();
       const expiresAt=row.expiresAt;
+      if(this.engine.media&&!this.engine.media.trim(Buffer.byteLength(dataUrl)+1024))return unavailable();
       this.store.transaction(()=>{this.store.set('photo',job.id,{version:job.version,dataUrl,expiresAt},{expires:expiresAt,created:Date.now(),tag:row.chat});this.engine.inbox.trim();});
       return this.row(job)?{state:'ready',dataUrl,expiresAt}:unavailable();
     }finally{clearTimeout(timer);job.abort.abort();for(const chunk of chunks)chunk.fill(0);encrypted?.fill(0);plain?.fill(0);}

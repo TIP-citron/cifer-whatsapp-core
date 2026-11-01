@@ -82,3 +82,12 @@ test('same-clock own reaction changes remain monotonic and survive a delayed ear
  const {f,socket}=await setup(t);socket.ev.emit('messages.upsert',{messages:[base()]});await drain();const row=(await rows(f))[0],real=Date.now,now=real();Date.now=()=>now;
  try{await f.engine.request('mutate',args(row,'👍'));await f.engine.request('mutate',args(row,'❤️'));assert.ok(socket.sent[1].content.react.senderTimestampMs>socket.sent[0].content.react.senderTimestampMs);await emit(socket,[event(target(),'👍',SELF,now,socket.sent[0].options.messageId)]);assert.deepEqual((await rows(f))[0].reactions,[{emoji:'❤️',count:1,mine:true}]);}finally{Date.now=real;}
 });
+
+test('compact historical group reactions preserve every authenticated participant',async t=>{
+ const {f,socket}=await setup(t,true),message=base('COMPACT',GROUP,PEER);
+ message.reactions=[event(message.key,'👍',SELF).reaction,...[PEER,OTHER].map(actor=>{
+   const reaction=event(message.key,'👍',actor).reaction;delete reaction.key.fromMe;delete reaction.key.remoteJid;return reaction;
+ })];
+ socket.ev.emit('messaging-history.set',{messages:[message],chats:[],contacts:[]});await drain();
+ assert.deepEqual((await rows(f,GROUP))[0].reactions,[{emoji:'👍',count:3,mine:true}]);
+});
